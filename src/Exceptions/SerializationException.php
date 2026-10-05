@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Marko\Queue\Exceptions;
 
+use Throwable;
+
 class SerializationException extends QueueException
 {
     public static function invalidJobData(
@@ -23,6 +25,20 @@ class SerializationException extends QueueException
             message: 'Job contains an unserializable closure.',
             context: "Job class '$jobClass' contains a Closure that cannot be serialized.",
             suggestion: 'Remove the Closure from the job or convert it to an invokable class.',
+        );
+    }
+
+    public static function unserializableEvent(
+        string $observerClass,
+        string $eventClass,
+        Throwable $previous,
+    ): self {
+        return new self(
+            message: "Cannot queue async observer $observerClass: its event could not be serialized.",
+            context: "Serializing event '$eventClass' for an AsyncObserverJob: {$previous->getMessage()}",
+            suggestion: 'Async observers receive a serialized copy of the event. Keep closures, resources and live '
+                . 'connections out of the event (pass IDs or plain values instead), or remove async: true from the observer.',
+            previous: $previous,
         );
     }
 

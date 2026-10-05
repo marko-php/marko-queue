@@ -2,7 +2,9 @@
 
 declare(strict_types=1);
 
+use Marko\Core\Event\AsyncObserverDispatcherInterface;
 use Marko\Queue\JobEnvelope;
+use Marko\Queue\QueueAsyncObserverDispatcher;
 use Marko\Queue\Worker;
 use Marko\Queue\WorkerInterface;
 
@@ -18,5 +20,12 @@ describe('queue module.php', function (): void {
         $module = require dirname(__DIR__) . '/module.php';
 
         expect($module['bindings'][JobEnvelope::class])->toBe(JobEnvelope::class);
+    });
+
+    it('binds AsyncObserverDispatcherInterface to QueueAsyncObserverDispatcher in module.php', function (): void {
+        $module = require dirname(__DIR__) . '/module.php';
+
+        expect($module['bindings'][AsyncObserverDispatcherInterface::class])
+            ->toBe(QueueAsyncObserverDispatcher::class);
     });
 });

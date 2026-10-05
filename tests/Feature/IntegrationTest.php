@@ -631,7 +631,7 @@ describe('Integration Tests', function (): void {
             ->and($queueConfig->queue())->toBe('default');
 
         // Verify SyncQueue implements QueueInterface
-        $syncQueue = new SyncQueue();
+        $syncQueue = new SyncQueue(createIntegrationNullContainer(), createIntegrationJobEnvelope());
 
         expect($syncQueue)->toBeInstanceOf(QueueInterface::class);
 
