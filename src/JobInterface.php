@@ -10,7 +10,10 @@ interface JobInterface
 
     public int $attempts { get; }
 
-    public int $maxAttempts { get; }
+    /**
+     * Maximum attempts for this job, or null to use the `queue.max_attempts` config default.
+     */
+    public ?int $maxAttempts { get; }
 
     public function handle(): void;
 

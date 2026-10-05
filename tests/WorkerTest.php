@@ -160,7 +160,7 @@ function createTestFailedJobRepository(): FailedJobRepositoryInterface
 
 class FailingTestJob extends Job
 {
-    public protected(set) int $maxAttempts = 2;
+    public protected(set) ?int $maxAttempts = 2;
 
     public function handle(): void
     {
@@ -343,7 +343,7 @@ describe('Worker', function (): void {
     test('handles job failures with retry', function (): void {
         $job = new class () extends Job
         {
-            public protected(set) int $maxAttempts = 3;
+            public protected(set) ?int $maxAttempts = 3;
 
             public function handle(): void
             {
@@ -740,7 +740,7 @@ describe('Worker', function (): void {
 
         $job = new class () extends Job
         {
-            public protected(set) int $maxAttempts = 5;
+            public protected(set) ?int $maxAttempts = 5;
 
             public function handle(): void
             {
@@ -933,4 +933,141 @@ describe('Worker', function (): void {
                 ->and($capture->event->payload)->toBe('worker-injects-container');
         },
     );
+});
+
+class ConfigDefaultFailingJob extends Job
+{
+    public function handle(): void
+    {
+        throw new RuntimeException('Always fails');
+    }
+}
+
+class SingleJobRecordingQueue implements QueueInterface
+{
+    private bool $popped = false;
+
+    /** @var list<int> */
+    public array $releasedWithDelays = [];
+
+    public bool $deleted = false;
+
+    public function __construct(
+        private readonly JobInterface $job,
+    ) {}
+
+    public function push(
+        JobInterface $job,
+        ?string $queue = null,
+    ): string {
+        return 'job-1';
+    }
+
+    public function later(
+        int $delay,
+        JobInterface $job,
+        ?string $queue = null,
+    ): string {
+        return 'job-1';
+    }
+
+    public function pop(
+        ?string $queue = null,
+    ): ?JobInterface {
+        if ($this->popped) {
+            return null;
+        }
+
+        $this->popped = true;
+
+        return $this->job;
+    }
+
+    public function size(
+        ?string $queue = null,
+    ): int {
+        return 0;
+    }
+
+    public function clear(
+        ?string $queue = null,
+    ): int {
+        return 0;
+    }
+
+    public function delete(
+        string $jobId,
+    ): bool {
+        $this->deleted = true;
+
+        return true;
+    }
+
+    public function release(
+        string $jobId,
+        int $delay = 0,
+    ): bool {
+        $this->releasedWithDelays[] = $delay;
+
+        return true;
+    }
+}
+
+/**
+ * Run one worker iteration for a failing job that has already used $priorAttempts attempts.
+ *
+ * @return array{queue: SingleJobRecordingQueue, failed: FailedJobRepositoryInterface}
+ */
+function runFailingJobOnce(
+    JobInterface $job,
+    int $priorAttempts,
+    int $configMaxAttempts,
+): array {
+    $job->setId('job-1');
+
+    for ($i = 0; $i < $priorAttempts; $i++) {
+        $job->incrementAttempts();
+    }
+
+    $queue = new SingleJobRecordingQueue($job);
+    $failedRepository = createTestFailedJobRepository();
+
+    $worker = new Worker(
+        $queue,
+        $failedRepository,
+        createTestQueueConfig(['queue.max_attempts' => $configMaxAttempts]),
+        createWorkerTestEnvelope(),
+        createNullWorkerContainer(),
+    );
+    $worker->work(once: true);
+
+    return ['queue' => $queue, 'failed' => $failedRepository];
+}
+
+describe('Worker max attempts', function (): void {
+    it(
+        'releases a failing job while attempts are below queue.max_attempts when the job sets no maxAttempts',
+        function (): void {
+            $result = runFailingJobOnce(new ConfigDefaultFailingJob(), priorAttempts: 3, configMaxAttempts: 5);
+
+            expect($result['queue']->releasedWithDelays)->toHaveCount(1)
+                ->and($result['failed']->count())->toBe(0);
+        },
+    );
+
+    it('fails a job once attempts reach queue.max_attempts when the job sets no maxAttempts', function (): void {
+        $result = runFailingJobOnce(new ConfigDefaultFailingJob(), priorAttempts: 4, configMaxAttempts: 5);
+
+        expect($result['queue']->releasedWithDelays)->toBe([])
+            ->and($result['queue']->deleted)->toBeTrue()
+            ->and($result['failed']->count())->toBe(1);
+    });
+
+    it('prefers the job maxAttempts over queue.max_attempts', function (): void {
+        // FailingTestJob declares maxAttempts = 2 while config allows 10
+        $result = runFailingJobOnce(new FailingTestJob(), priorAttempts: 1, configMaxAttempts: 10);
+
+        expect($result['queue']->releasedWithDelays)->toBe([])
+            ->and($result['failed']->count())->toBe(1);
+    });
 });

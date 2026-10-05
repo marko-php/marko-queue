@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Marko\Encryption\Config\EncryptionConfig;
 use Marko\Queue\Exceptions\SerializationException;
 use Marko\Queue\JobEnvelope;
+use Marko\Queue\Tests\Fixtures\PrivatePropertyJob;
 use Marko\Testing\Fake\FakeConfigRepository;
 
 function createJobEnvelope(
@@ -23,9 +24,63 @@ describe('JobEnvelope', function (): void {
         $wrapped = $envelope->wrap($serialized);
 
         expect($wrapped)->toBeString()
-            ->and(strlen($wrapped))->toBe(64 + 1 + strlen($serialized))
             ->and($wrapped[64])->toBe('.');
     });
+
+    it('wraps payloads in the b64 envelope format', function (): void {
+        $envelope = createJobEnvelope();
+        $serialized = 'O:8:"TestJob":1:{s:7:"message";s:4:"test";}';
+        $body = 'b64:' . base64_encode($serialized);
+
+        $wrapped = $envelope->wrap($serialized);
+
+        expect(substr($wrapped, 65))->toBe($body)
+            ->and(substr($wrapped, 0, 64))->toBe(hash_hmac('sha256', $body, 'test-key-for-hmac-verification'));
+    });
+
+    it('produces envelopes without NUL bytes for objects with private and protected properties', function (): void {
+        $envelope = createJobEnvelope();
+        $serialized = serialize(new PrivatePropertyJob('secret', 'shared'));
+
+        expect(str_contains($serialized, "\0"))->toBeTrue()
+            ->and(str_contains($envelope->wrap($serialized), "\0"))->toBeFalse();
+    });
+
+    it('round-trips a new-format envelope back to the original serialized bytes', function (): void {
+        $envelope = createJobEnvelope();
+        $serialized = serialize(new PrivatePropertyJob('secret', 'shared'));
+
+        expect($envelope->verifyAndUnwrap($envelope->wrap($serialized)))->toBe($serialized);
+    });
+
+    it('still verifies and unwraps legacy raw envelopes', function (): void {
+        $envelope = createJobEnvelope();
+        $serialized = serialize(new PrivatePropertyJob('secret', 'shared'));
+        $legacy = hash_hmac('sha256', $serialized, 'test-key-for-hmac-verification') . '.' . $serialized;
+
+        expect($envelope->verifyAndUnwrap($legacy))->toBe($serialized);
+    });
+
+    it('rejects a new-format envelope whose base64 was tampered with', function (): void {
+        $envelope = createJobEnvelope();
+        $wrapped = $envelope->wrap('O:8:"TestJob":1:{s:7:"message";s:4:"test";}');
+        $tampered = substr($wrapped, 0, 69) . base64_encode('O:7:"EvilJob":0:{}');
+
+        expect(fn () => $envelope->verifyAndUnwrap($tampered))
+            ->toThrow(SerializationException::class);
+    });
+
+    it(
+        'rejects a new-format envelope whose b64 body is not valid base64 even with a valid signature',
+        function (): void {
+            $envelope = createJobEnvelope();
+            $body = 'b64:not*valid*base64!';
+            $forged = hash_hmac('sha256', $body, 'test-key-for-hmac-verification') . '.' . $body;
+
+            expect(fn () => $envelope->verifyAndUnwrap($forged))
+                ->toThrow(SerializationException::class, 'Invalid job data');
+        },
+    );
 
     it('verifies and unwraps a legitimately signed envelope', function (): void {
         $envelope = createJobEnvelope();

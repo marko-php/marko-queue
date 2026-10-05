@@ -57,7 +57,8 @@ describe('JobInterface', function (): void {
         $maxAttemptsProperty = $reflection->getProperty('maxAttempts');
 
         expect($maxAttemptsProperty->isPublic())->toBeTrue()
-            ->and($maxAttemptsProperty->getType()?->getName())->toBe('int');
+            ->and($maxAttemptsProperty->getType()?->getName())->toBe('int')
+            ->and($maxAttemptsProperty->getType()?->allowsNull())->toBeTrue();
 
         $incrementAttempts = $reflection->getMethod('incrementAttempts');
 

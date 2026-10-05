@@ -75,7 +75,9 @@ class Worker implements WorkerInterface
         Throwable $e,
         ?string $queue,
     ): void {
-        if ($job->attempts < $job->maxAttempts) {
+        $maxAttempts = $job->maxAttempts ?? $this->config->maxAttempts();
+
+        if ($job->attempts < $maxAttempts) {
             $delay = (int) pow(2, $job->attempts) * 10;
             $this->queue->release($job->id, $delay);
         } else {

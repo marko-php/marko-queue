@@ -19,7 +19,7 @@ class TestJob extends Job
 
 class CustomMaxAttemptsJob extends Job
 {
-    public protected(set) int $maxAttempts = 10;
+    public protected(set) ?int $maxAttempts = 10;
 
     public function handle(): void
     {
@@ -67,10 +67,10 @@ describe('Job', function (): void {
         expect($job->attempts)->toBe(3);
     });
 
-    it('has default max attempts of 3', function (): void {
+    it('defaults Job maxAttempts to null so the config default applies', function (): void {
         $job = new TestJob();
 
-        expect($job->maxAttempts)->toBe(3);
+        expect($job->maxAttempts)->toBeNull();
     });
 
     it('returns null id by default', function (): void {
@@ -89,7 +89,7 @@ describe('Job', function (): void {
     it('Job handles custom maxAttempts', function (): void {
         $customJob = new class () extends Job
         {
-            public protected(set) int $maxAttempts = 5;
+            public protected(set) ?int $maxAttempts = 5;
 
             public function handle(): void
             {
@@ -102,7 +102,7 @@ describe('Job', function (): void {
         // Test another custom value
         $singleAttemptJob = new class () extends Job
         {
-            public protected(set) int $maxAttempts = 1;
+            public protected(set) ?int $maxAttempts = 1;
 
             public function handle(): void {}
         };

@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 use Marko\Queue\Exceptions\NoDriverException;
 use Marko\Queue\Exceptions\QueueException;
+use Marko\Queue\FailedJobRepositoryInterface;
+use Marko\Queue\QueueInterface;
+use Marko\Queue\WorkerInterface;
 
 describe('NoDriverException', function (): void {
     it('loads the driver list from known-drivers.php', function (): void {
@@ -84,6 +87,36 @@ describe('NoDriverException', function (): void {
         $exception = NoDriverException::noDriverInstalled();
 
         expect($exception->getContext())->toContain('queue interface');
+    });
+
+    it('keeps the driver install message when called without an interface', function (): void {
+        $exception = NoDriverException::noDriverInstalled();
+
+        expect($exception->getMessage())->toBe('No queue driver installed.');
+    });
+
+    it('keeps the driver install message for QueueInterface and FailedJobRepositoryInterface', function (): void {
+        $queueException = NoDriverException::noDriverInstalled(QueueInterface::class);
+        $failedJobException = NoDriverException::noDriverInstalled(FailedJobRepositoryInterface::class);
+
+        expect($queueException->getMessage())->toBe('No queue driver installed.')
+            ->and($failedJobException->getMessage())->toBe('No queue driver installed.')
+            ->and($queueException->getSuggestion())->toContain('composer require marko/queue-database');
+    });
+
+    it('names the unbound interface when it is not a driver contract', function (): void {
+        $exception = NoDriverException::noDriverInstalled(WorkerInterface::class);
+
+        expect($exception->getMessage())->toBe('No implementation is bound for ' . WorkerInterface::class . '.')
+            ->and($exception->getMessage())->not->toContain('No queue driver installed');
+    });
+
+    it('suggests binding the interface in module.php when it is not a driver contract', function (): void {
+        $exception = NoDriverException::noDriverInstalled(WorkerInterface::class);
+
+        expect($exception->getSuggestion())
+            ->toContain('module.php')
+            ->and($exception->getSuggestion())->toContain(WorkerInterface::class);
     });
 
     it('extends QueueException', function (): void {
