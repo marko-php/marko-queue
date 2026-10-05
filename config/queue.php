@@ -8,4 +8,10 @@ return [
     'queue' => 'default',
     'retry_after' => 90,
     'max_attempts' => 3,
+
+    // Seconds to wait before retrying a failed job, used when the job sets no $backoff.
+    // - int: fixed delay for every retry, e.g. 30
+    // - list<int>: delay per attempt, e.g. [10, 60, 300]; the last value repeats
+    // - null: exponential curve of 2^attempts * 10 seconds (20, 40, 80, ...)
+    'backoff' => null,
 ];

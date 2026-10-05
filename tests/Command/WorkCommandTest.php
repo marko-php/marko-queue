@@ -10,6 +10,34 @@ use Marko\Queue\Tests\Command\Helpers;
 use Marko\Queue\WorkerInterface;
 
 /**
+ * Worker stub that records the arguments queue:work passes to it.
+ */
+class CapturingWorker implements WorkerInterface
+{
+    public bool $called = false;
+
+    /** @var list<string>|null */
+    public ?array $queues = null;
+
+    public ?bool $once = null;
+
+    public ?int $sleep = null;
+
+    public function work(
+        ?array $queues = null,
+        bool $once = false,
+        int $sleep = 3,
+    ): void {
+        $this->called = true;
+        $this->queues = $queues;
+        $this->once = $once;
+        $this->sleep = $sleep;
+    }
+
+    public function stop(): void {}
+}
+
+/**
  * Helper to execute WorkCommand and return output.
  *
  * @param array<string> $args
@@ -57,7 +85,7 @@ it('processes jobs continuously', function (): void {
         ) {}
 
         public function work(
-            ?string $queue = null,
+            ?array $queues = null,
             bool $once = false,
             int $sleep = 3,
         ): void {
@@ -78,85 +106,87 @@ it('processes jobs continuously', function (): void {
 });
 
 it('supports once flag', function (): void {
-    $capture = (object) ['once' => null];
+    $worker = new CapturingWorker();
 
-    $worker = new readonly class ($capture) implements WorkerInterface
-    {
-        public function __construct(
-            private object $capture,
-        ) {}
+    executeWorkCommand(new WorkCommand($worker), ['marko', 'queue:work', '--once']);
 
-        public function work(
-            ?string $queue = null,
-            bool $once = false,
-            int $sleep = 3,
-        ): void {
-            $this->capture->once = $once;
-        }
-
-        public function stop(): void {}
-    };
-
-    $command = new WorkCommand($worker);
-    executeWorkCommand($command, ['marko', 'queue:work', '--once']);
-
-    expect($capture->once)->toBeTrue();
+    expect($worker->once)->toBeTrue();
 });
 
-it('supports queue option', function (): void {
-    $capture = (object) ['queue' => null];
+it('passes a single queue as a one-item list', function (): void {
+    $worker = new CapturingWorker();
 
-    $worker = new readonly class ($capture) implements WorkerInterface
-    {
-        public function __construct(
-            private object $capture,
-        ) {}
+    executeWorkCommand(new WorkCommand($worker), ['marko', 'queue:work', '--queue=emails']);
 
-        public function work(
-            ?string $queue = null,
-            bool $once = false,
-            int $sleep = 3,
-        ): void {
-            $this->capture->queue = $queue;
-        }
-
-        public function stop(): void {}
-    };
-
-    $command = new WorkCommand($worker);
-    executeWorkCommand($command, ['marko', 'queue:work', '--queue=emails']);
-
-    expect($capture->queue)->toBe('emails');
+    expect($worker->queues)->toBe(['emails']);
 });
 
 it('works the emails queue for queue:work --queue emails', function (): void {
-    $capture = (object) ['queue' => null, 'once' => null, 'sleep' => null];
+    $worker = new CapturingWorker();
 
-    $worker = new readonly class ($capture) implements WorkerInterface
-    {
-        public function __construct(
-            private object $capture,
-        ) {}
+    executeWorkCommand(
+        new WorkCommand($worker),
+        ['marko', 'queue:work', '--once', '--queue', 'emails', '--sleep', '5'],
+    );
 
-        public function work(
-            ?string $queue = null,
-            bool $once = false,
-            int $sleep = 3,
-        ): void {
-            $this->capture->queue = $queue;
-            $this->capture->once = $once;
-            $this->capture->sleep = $sleep;
-        }
+    expect($worker->queues)->toBe(['emails'])
+        ->and($worker->once)->toBeTrue()
+        ->and($worker->sleep)->toBe(5);
+});
 
-        public function stop(): void {}
-    };
+it('parses --queue=a,b --sleep=1 into a queue list and sleep', function (): void {
+    $worker = new CapturingWorker();
 
-    $command = new WorkCommand($worker);
-    executeWorkCommand($command, ['marko', 'queue:work', '--once', '--queue', 'emails', '--sleep', '5']);
+    executeWorkCommand(new WorkCommand($worker), ['marko', 'queue:work', '--queue=a,b', '--sleep=1']);
 
-    expect($capture->queue)->toBe('emails')
-        ->and($capture->once)->toBeTrue()
-        ->and($capture->sleep)->toBe(5);
+    expect($worker->queues)->toBe(['a', 'b'])
+        ->and($worker->sleep)->toBe(1);
+});
+
+it('keeps the priority order of --queue=high,default,low', function (): void {
+    $worker = new CapturingWorker();
+
+    executeWorkCommand(new WorkCommand($worker), ['marko', 'queue:work', '--queue=high,default,low']);
+
+    expect($worker->queues)->toBe(['high', 'default', 'low']);
+});
+
+it('trims whitespace around queue names', function (): void {
+    $worker = new CapturingWorker();
+
+    executeWorkCommand(new WorkCommand($worker), ['marko', 'queue:work', '--queue', ' high , low ']);
+
+    expect($worker->queues)->toBe(['high', 'low']);
+});
+
+it('drops empty segments such as --queue=high,,low', function (): void {
+    $worker = new CapturingWorker();
+
+    executeWorkCommand(new WorkCommand($worker), ['marko', 'queue:work', '--queue=high,,low,']);
+
+    expect($worker->queues)->toBe(['high', 'low']);
+});
+
+it('passes null when no queue option is given', function (): void {
+    $worker = new CapturingWorker();
+
+    executeWorkCommand(new WorkCommand($worker));
+
+    expect($worker->called)->toBeTrue()
+        ->and($worker->queues)->toBeNull();
+});
+
+it('fails loudly when --queue contains no queue names', function (): void {
+    $worker = new CapturingWorker();
+
+    ['output' => $output, 'exitCode' => $exitCode] = executeWorkCommand(
+        new WorkCommand($worker),
+        ['marko', 'queue:work', '--queue=,'],
+    );
+
+    expect($exitCode)->toBe(1)
+        ->and($output)->toContain('--queue needs at least one queue name')
+        ->and($worker->called)->toBeFalse();
 });
 
 it('declares once as a flag on queue:work', function (): void {
@@ -166,45 +196,15 @@ it('declares once as a flag on queue:work', function (): void {
 });
 
 it('supports sleep option', function (): void {
-    $capture = (object) ['sleep' => null];
+    $worker = new CapturingWorker();
 
-    $worker = new readonly class ($capture) implements WorkerInterface
-    {
-        public function __construct(
-            private object $capture,
-        ) {}
+    executeWorkCommand(new WorkCommand($worker), ['marko', 'queue:work', '--sleep=5']);
 
-        public function work(
-            ?string $queue = null,
-            bool $once = false,
-            int $sleep = 3,
-        ): void {
-            $this->capture->sleep = $sleep;
-        }
-
-        public function stop(): void {}
-    };
-
-    $command = new WorkCommand($worker);
-    executeWorkCommand($command, ['marko', 'queue:work', '--sleep=5']);
-
-    expect($capture->sleep)->toBe(5);
+    expect($worker->sleep)->toBe(5);
 });
 
 it('displays processing status', function (): void {
-    $worker = new class () implements WorkerInterface
-    {
-        public function work(
-            ?string $queue = null,
-            bool $once = false,
-            int $sleep = 3,
-        ): void {}
-
-        public function stop(): void {}
-    };
-
-    $command = new WorkCommand($worker);
-    ['output' => $output] = executeWorkCommand($command);
+    ['output' => $output] = executeWorkCommand(new WorkCommand(new CapturingWorker()));
 
     expect($output)->toContain('Processing jobs from queue');
 });

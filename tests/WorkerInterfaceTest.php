@@ -17,8 +17,8 @@ describe('WorkerInterface', function () {
         $parameters = $method->getParameters();
 
         expect($parameters)->toHaveCount(3)
-            ->and($parameters[0]->getName())->toBe('queue')
-            ->and($parameters[0]->getType()?->getName())->toBe('string')
+            ->and($parameters[0]->getName())->toBe('queues')
+            ->and($parameters[0]->getType()?->getName())->toBe('array')
             ->and($parameters[0]->allowsNull())->toBeTrue()
             ->and($parameters[1]->getName())->toBe('once')
             ->and($parameters[1]->getType()?->getName())->toBe('bool')

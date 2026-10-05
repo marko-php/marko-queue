@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Marko\Config\Exceptions\ConfigNotFoundException;
+use Marko\Queue\Exceptions\QueueException;
 use Marko\Queue\QueueConfig;
 use Marko\Testing\Fake\FakeConfigRepository;
 
@@ -99,5 +100,35 @@ describe('QueueConfig', function (): void {
             ->and($customQueueConfig->queue())->toBe('high-priority')
             ->and($customQueueConfig->retryAfter())->toBe(300)
             ->and($customQueueConfig->maxAttempts())->toBe(5);
+    });
+
+    it('returns the configured int or list backoff', function (): void {
+        $intConfig = new QueueConfig(new FakeConfigRepository(['queue.backoff' => 15]));
+        $listConfig = new QueueConfig(new FakeConfigRepository(['queue.backoff' => [10, 60, 300]]));
+
+        expect($intConfig->backoff())->toBe(15)
+            ->and($listConfig->backoff())->toBe([10, 60, 300]);
+    });
+
+    it('returns null for backoff when the key is null or absent', function (): void {
+        // An app override of null removes the key in ConfigMerger, so absent means null too
+        $nullConfig = new QueueConfig(new FakeConfigRepository(['queue.backoff' => null]));
+        $absentConfig = new QueueConfig(new FakeConfigRepository());
+
+        expect($nullConfig->backoff())->toBeNull()
+            ->and($absentConfig->backoff())->toBeNull();
+    });
+
+    it('throws QueueException when queue.backoff is not an int, list or null', function (): void {
+        $config = new QueueConfig(new FakeConfigRepository(['queue.backoff' => '30']));
+
+        expect(fn () => $config->backoff())->toThrow(QueueException::class, 'Invalid queue backoff');
+    });
+
+    it('ships a null backoff in config/queue.php', function (): void {
+        $config = require dirname(__DIR__) . '/config/queue.php';
+
+        expect($config)->toHaveKey('backoff')
+            ->and($config['backoff'])->toBeNull();
     });
 });

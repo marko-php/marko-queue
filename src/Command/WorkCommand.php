@@ -25,13 +25,33 @@ class WorkCommand implements CommandInterface
         Output $output,
     ): int {
         $once = $input->hasOption('once');
-        $queue = $input->getOption('queue');
+        $queueOption = $input->getOption('queue');
         $sleep = (int) ($input->getOption('sleep') ?? self::DEFAULT_SLEEP);
+        $queues = $queueOption === null ? null : $this->parseQueues($queueOption);
+
+        if ($queues === []) {
+            $output->writeLine('Error: --queue needs at least one queue name, e.g. --queue=high,default.');
+
+            return 1;
+        }
 
         $output->writeLine('Processing jobs from queue...');
 
-        $this->worker->work(queue: $queue, once: $once, sleep: $sleep);
+        $this->worker->work(queues: $queues, once: $once, sleep: $sleep);
 
         return 0;
+    }
+
+    /**
+     * Split a comma-separated --queue value into queue names in priority order.
+     *
+     * @return list<string>
+     */
+    private function parseQueues(
+        string $value,
+    ): array {
+        $names = array_map(trim(...), explode(',', $value));
+
+        return array_values(array_filter($names, fn (string $name): bool => $name !== ''));
     }
 }

@@ -27,7 +27,30 @@ class CustomMaxAttemptsJob extends Job
     }
 }
 
+class FixedBackoffJob extends Job
+{
+    public protected(set) array|int|null $backoff = 5;
+
+    public function handle(): void {}
+}
+
+class ListBackoffJob extends Job
+{
+    public protected(set) array|int|null $backoff = [5, 30, 120];
+
+    public function handle(): void {}
+}
+
 describe('Job', function (): void {
+    it('defaults backoff to null so the queue.backoff config applies', function (): void {
+        expect((new TestJob())->backoff)->toBeNull();
+    });
+
+    it('lets a job subclass declare an int or list backoff', function (): void {
+        expect((new FixedBackoffJob())->backoff)->toBe(5)
+            ->and((new ListBackoffJob())->backoff)->toBe([5, 30, 120]);
+    });
+
     it('implements JobInterface', function (): void {
         $reflection = new ReflectionClass(Job::class);
 

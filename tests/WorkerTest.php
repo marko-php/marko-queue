@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Marko\Core\Container\ContainerInterface;
 use Marko\Encryption\Config\EncryptionConfig;
 use Marko\Queue\AsyncObserverJob;
+use Marko\Queue\Exceptions\QueueException;
 use Marko\Queue\FailedJob;
 use Marko\Queue\FailedJobRepositoryInterface;
 use Marko\Queue\Job;
@@ -1070,4 +1071,392 @@ describe('Worker max attempts', function (): void {
         expect($result['queue']->releasedWithDelays)->toBe([])
             ->and($result['failed']->count())->toBe(1);
     });
+});
+
+class BackoffFailingJob extends Job
+{
+    /**
+     * @param int|list<int>|null $backoff
+     */
+    public function __construct(
+        array|int|null $backoff = null,
+    ) {
+        $this->backoff = $backoff;
+    }
+
+    public function handle(): void
+    {
+        throw new RuntimeException('Always fails');
+    }
+}
+
+function jobAfterAttempts(
+    JobInterface $job,
+    int $attempts,
+): JobInterface {
+    for ($i = 0; $i < $attempts; $i++) {
+        $job->incrementAttempts();
+    }
+
+    return $job;
+}
+
+function createBackoffWorker(
+    array $configValues = [],
+): Worker {
+    return new Worker(
+        new SingleJobRecordingQueue(new BackoffFailingJob()),
+        createTestFailedJobRepository(),
+        createTestQueueConfig($configValues),
+        createWorkerTestEnvelope(),
+        createNullWorkerContainer(),
+    );
+}
+
+describe('Worker backoff', function (): void {
+    it('uses a fixed int job backoff for every attempt', function (): void {
+        $worker = createBackoffWorker();
+
+        expect($worker->backoffFor(jobAfterAttempts(new BackoffFailingJob(5), 1)))->toBe(5)
+            ->and($worker->backoffFor(jobAfterAttempts(new BackoffFailingJob(5), 4)))->toBe(5);
+    });
+
+    it('uses the list job backoff per attempt and repeats the last value', function (): void {
+        $worker = createBackoffWorker();
+        $delays = array_map(
+            fn (int $attempts): int => $worker->backoffFor(
+                jobAfterAttempts(new BackoffFailingJob([5, 30, 120]), $attempts),
+            ),
+            [1, 2, 3, 4, 7],
+        );
+
+        expect($delays)->toBe([5, 30, 120, 120, 120]);
+    });
+
+    it('falls back to the queue.backoff config when the job sets none', function (): void {
+        $intWorker = createBackoffWorker(['queue.backoff' => 15]);
+        $listWorker = createBackoffWorker(['queue.backoff' => [10, 60]]);
+
+        expect($intWorker->backoffFor(jobAfterAttempts(new BackoffFailingJob(), 2)))->toBe(15)
+            ->and($listWorker->backoffFor(jobAfterAttempts(new BackoffFailingJob(), 1)))->toBe(10)
+            ->and($listWorker->backoffFor(jobAfterAttempts(new BackoffFailingJob(), 3)))->toBe(60);
+    });
+
+    it('prefers the job backoff over the queue.backoff config', function (): void {
+        $worker = createBackoffWorker(['queue.backoff' => 99]);
+
+        expect($worker->backoffFor(jobAfterAttempts(new BackoffFailingJob(7), 1)))->toBe(7);
+    });
+
+    it('keeps the 2^attempts * 10 curve when neither job nor config sets backoff', function (): void {
+        $worker = createBackoffWorker(['queue.backoff' => null]);
+        $delays = array_map(
+            fn (int $attempts): int => $worker->backoffFor(jobAfterAttempts(new BackoffFailingJob(), $attempts)),
+            [1, 2, 3, 6],
+        );
+
+        expect($delays)->toBe([20, 40, 80, 640]);
+    });
+
+    it('throws QueueException for a negative or empty backoff', function (array|int $backoff): void {
+        $worker = createBackoffWorker();
+
+        expect(fn () => $worker->backoffFor(jobAfterAttempts(new BackoffFailingJob($backoff), 1)))
+            ->toThrow(QueueException::class, 'Invalid queue backoff');
+    })->with([
+        'negative int' => [-1],
+        'empty list' => [[[]]],
+        'negative list entry' => [[[10, -5]]],
+        'non-list array' => [[['a' => 10]]],
+    ]);
+
+    it('throws QueueException for an invalid queue.backoff config list', function (): void {
+        $worker = createBackoffWorker(['queue.backoff' => [10, 'soon']]);
+
+        expect(fn () => $worker->backoffFor(jobAfterAttempts(new BackoffFailingJob(), 1)))
+            ->toThrow(QueueException::class, 'Invalid queue backoff in config queue.backoff');
+    });
+
+    it('releases a failed job with the backoffFor delay', function (): void {
+        $result = runFailingJobOnce(new BackoffFailingJob([3, 9]), priorAttempts: 1, configMaxAttempts: 5);
+
+        // Attempt 2 fails, so the second list entry applies
+        expect($result['queue']->releasedWithDelays)->toBe([9]);
+    });
+});
+
+class RecordingLog
+{
+    /** @var list<string> */
+    public array $entries = [];
+}
+
+class NamedRecordingJob extends Job
+{
+    public function __construct(
+        public string $name,
+        public RecordingLog $log,
+        public bool $fails = false,
+    ) {}
+
+    public function handle(): void
+    {
+        $this->log->entries[] = "handle:$this->name";
+
+        if ($this->fails) {
+            throw new RuntimeException("$this->name failed");
+        }
+    }
+}
+
+class MultiQueueRecordingQueue implements QueueInterface
+{
+    /**
+     * @param array<string, list<JobInterface>> $jobs
+     */
+    public function __construct(
+        public array $jobs,
+        private readonly RecordingLog $log,
+    ) {}
+
+    public function push(
+        JobInterface $job,
+        ?string $queue = null,
+    ): string {
+        $this->jobs[$queue ?? 'default'][] = $job;
+
+        return 'pushed';
+    }
+
+    public function later(
+        int $delay,
+        JobInterface $job,
+        ?string $queue = null,
+    ): string {
+        return 'later';
+    }
+
+    public function pop(
+        ?string $queue = null,
+    ): ?JobInterface {
+        $this->log->entries[] = 'pop:' . ($queue ?? 'null');
+        $name = $queue ?? 'default';
+
+        if (($this->jobs[$name] ?? []) === []) {
+            return null;
+        }
+
+        return array_shift($this->jobs[$name]);
+    }
+
+    public function size(
+        ?string $queue = null,
+    ): int {
+        return count($this->jobs[$queue ?? 'default'] ?? []);
+    }
+
+    public function clear(
+        ?string $queue = null,
+    ): int {
+        return 0;
+    }
+
+    public function delete(
+        string $jobId,
+    ): bool {
+        return true;
+    }
+
+    public function release(
+        string $jobId,
+        int $delay = 0,
+    ): bool {
+        return true;
+    }
+}
+
+/**
+ * Records each pause instead of sleeping, and stops the worker after the given number of pauses.
+ */
+class PauseRecordingWorker extends Worker
+{
+    private int $pauses = 0;
+
+    public function __construct(
+        QueueInterface $queue,
+        FailedJobRepositoryInterface $failedJobRepository,
+        QueueConfig $config,
+        private readonly RecordingLog $log,
+        private readonly int $stopAfterPauses = 1,
+    ) {
+        parent::__construct(
+            $queue,
+            $failedJobRepository,
+            $config,
+            createWorkerTestEnvelope(),
+            createNullWorkerContainer(),
+        );
+    }
+
+    protected function pause(
+        int $seconds,
+    ): void {
+        $this->log->entries[] = "sleep:$seconds";
+        $this->pauses++;
+
+        if ($this->pauses >= $this->stopAfterPauses) {
+            $this->stop();
+        }
+    }
+}
+
+function namedJob(
+    string $name,
+    RecordingLog $log,
+    bool $fails = false,
+): NamedRecordingJob {
+    $job = new NamedRecordingJob($name, $log, $fails);
+    $job->setId($name);
+
+    return $job;
+}
+
+function createPauseRecordingWorker(
+    MultiQueueRecordingQueue $queue,
+    RecordingLog $log,
+    ?FailedJobRepositoryInterface $failed = null,
+    array $configValues = [],
+): PauseRecordingWorker {
+    return new PauseRecordingWorker(
+        $queue,
+        $failed ?? createTestFailedJobRepository(),
+        createTestQueueConfig($configValues),
+        $log,
+    );
+}
+
+describe('Worker priority queues', function (): void {
+    it('processes jobs on the high queue before jobs on the low queue', function (): void {
+        $log = new RecordingLog();
+        $queue = new MultiQueueRecordingQueue([
+            'low' => [namedJob('low-1', $log)],
+            'high' => [namedJob('high-1', $log), namedJob('high-2', $log)],
+        ], $log);
+
+        createPauseRecordingWorker($queue, $log)->work(queues: ['high', 'low'], sleep: 0);
+
+        $handled = array_values(array_filter(
+            $log->entries,
+            fn (string $entry): bool => str_starts_with($entry, 'handle:'),
+        ));
+
+        expect($handled)->toBe(['handle:high-1', 'handle:high-2', 'handle:low-1']);
+    });
+
+    it('returns to the highest priority queue after each processed job', function (): void {
+        $log = new RecordingLog();
+        $queue = new MultiQueueRecordingQueue([
+            'high' => [],
+            'low' => [namedJob('low-1', $log)],
+        ], $log);
+
+        createPauseRecordingWorker($queue, $log)->work(queues: ['high', 'low'], sleep: 0);
+
+        expect($log->entries)->toBe([
+            'pop:high', 'pop:low', 'handle:low-1',
+            'pop:high', 'pop:low', 'sleep:0',
+        ]);
+    });
+
+    it('sleeps only when every listed queue is empty', function (): void {
+        $log = new RecordingLog();
+        $queue = new MultiQueueRecordingQueue([
+            'high' => [],
+            'default' => [namedJob('default-1', $log)],
+            'low' => [],
+        ], $log);
+
+        createPauseRecordingWorker($queue, $log)->work(queues: ['high', 'default', 'low'], sleep: 5);
+
+        expect($log->entries)->toBe([
+            'pop:high', 'pop:default', 'handle:default-1',
+            'pop:high', 'pop:default', 'pop:low', 'sleep:5',
+        ]);
+    });
+
+    it('processes at most one job across all queues with once', function (): void {
+        $log = new RecordingLog();
+        $queue = new MultiQueueRecordingQueue([
+            'high' => [namedJob('high-1', $log)],
+            'low' => [namedJob('low-1', $log)],
+        ], $log);
+
+        createPauseRecordingWorker($queue, $log)->work(queues: ['high', 'low'], once: true);
+
+        expect($log->entries)->toBe(['pop:high', 'handle:high-1'])
+            ->and($queue->jobs['low'])->toHaveCount(1);
+    });
+
+    it('returns without sleeping with once when every queue is empty', function (): void {
+        $log = new RecordingLog();
+        $queue = new MultiQueueRecordingQueue(['high' => [], 'low' => []], $log);
+
+        createPauseRecordingWorker($queue, $log)->work(queues: ['high', 'low'], once: true);
+
+        expect($log->entries)->toBe(['pop:high', 'pop:low']);
+    });
+
+    it('records the concrete queue a failed job was popped from', function (): void {
+        $log = new RecordingLog();
+        $queue = new MultiQueueRecordingQueue([
+            'high' => [],
+            'low' => [namedJob('low-fail', $log, fails: true)],
+        ], $log);
+        $failed = createTestFailedJobRepository();
+
+        createPauseRecordingWorker($queue, $log, $failed, ['queue.max_attempts' => 1])
+            ->work(queues: ['high', 'low'], once: true);
+
+        expect($failed->find('low-fail')?->queue)->toBe('low');
+    });
+
+    it('records the config default queue when no queues are given', function (): void {
+        $log = new RecordingLog();
+        $queue = new MultiQueueRecordingQueue(['default' => [namedJob('default-fail', $log, fails: true)]], $log);
+        $failed = createTestFailedJobRepository();
+
+        createPauseRecordingWorker($queue, $log, $failed, ['queue.max_attempts' => 1, 'queue.queue' => 'emails'])
+            ->work(once: true);
+
+        expect($failed->find('default-fail')?->queue)->toBe('emails');
+    });
+
+    it('pops the driver default queue when queues is null', function (): void {
+        $log = new RecordingLog();
+        $queue = new MultiQueueRecordingQueue(['default' => []], $log);
+
+        createPauseRecordingWorker($queue, $log)->work(sleep: 0);
+
+        expect($log->entries)->toBe(['pop:null', 'sleep:0']);
+    });
+
+    it('throws QueueException when given an empty queue list', function (): void {
+        $log = new RecordingLog();
+        $worker = createPauseRecordingWorker(new MultiQueueRecordingQueue([], $log), $log);
+
+        expect(fn () => $worker->work(queues: [], once: true))
+            ->toThrow(QueueException::class, 'No queues given');
+    });
+
+    it('throws QueueException when a queue name is blank or not a string', function (array $queues): void {
+        $log = new RecordingLog();
+        $worker = createPauseRecordingWorker(new MultiQueueRecordingQueue([], $log), $log);
+
+        expect(fn () => $worker->work(queues: $queues, once: true))
+            ->toThrow(QueueException::class, 'Invalid queue name');
+    })->with([
+        'blank' => [['high', ' ']],
+        'not a string' => [['high', 5]],
+        'not a list' => [['first' => 'high']],
+    ]);
 });

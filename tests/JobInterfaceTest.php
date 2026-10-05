@@ -86,4 +86,17 @@ describe('JobInterface', function (): void {
             ->and($unserialize->getParameters()[0]->getName())->toBe('data')
             ->and($unserialize->getParameters()[0]->getType()?->getName())->toBe('string');
     });
+
+    it('declares a backoff get hook on JobInterface', function (): void {
+        $reflection = new ReflectionClass(JobInterface::class);
+
+        expect($reflection->hasProperty('backoff'))->toBeTrue();
+
+        $property = $reflection->getProperty('backoff');
+        $type = $property->getType();
+
+        expect($property->isPublic())->toBeTrue()
+            ->and($type)->toBeInstanceOf(ReflectionUnionType::class)
+            ->and((string) $type)->toBe('array|int|null');
+    });
 });

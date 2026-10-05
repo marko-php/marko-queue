@@ -15,6 +15,17 @@ interface JobInterface
      */
     public ?int $maxAttempts { get; }
 
+    /**
+     * Seconds to wait before retrying this job after a failed attempt.
+     *
+     * An int is a fixed delay for every retry. A list gives the delay per attempt
+     * (the first entry after attempt 1, the second after attempt 2, ...), and its
+     * last value repeats once the list runs out. Null uses the `queue.backoff` config.
+     *
+     * @var int|list<int>|null
+     */
+    public array|int|null $backoff { get; }
+
     public function handle(): void;
 
     public function setId(string $id): void;
