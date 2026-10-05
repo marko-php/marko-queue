@@ -15,7 +15,7 @@ use Marko\Queue\JobInterface;
 use Marko\Queue\QueueInterface;
 
 /** @noinspection PhpUnused */
-#[Command(name: 'queue:retry', description: 'Retry failed jobs')]
+#[Command(name: 'queue:retry', description: 'Retry failed jobs', flags: ['all'])]
 readonly class RetryCommand implements CommandInterface
 {
     public function __construct(
@@ -31,7 +31,7 @@ readonly class RetryCommand implements CommandInterface
         Input $input,
         Output $output,
     ): int {
-        if ($this->hasAllFlag($input)) {
+        if ($input->hasOption('all')) {
             return $this->retryAll($output);
         }
 
@@ -44,12 +44,6 @@ readonly class RetryCommand implements CommandInterface
         }
 
         return $this->retryJob($jobId, $output);
-    }
-
-    private function hasAllFlag(
-        Input $input,
-    ): bool {
-        return array_any($input->getArguments(), fn ($arg) => $arg === '--all');
     }
 
     /**

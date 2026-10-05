@@ -63,6 +63,12 @@ it('registers as queue:retry command via #[Command] attribute', function (): voi
         ->and($attributes[0]->newInstance()->name)->toBe('queue:retry');
 });
 
+it('declares all as a flag on queue:retry', function (): void {
+    $attribute = new ReflectionClass(RetryCommand::class)->getAttributes(Command::class)[0]->newInstance();
+
+    expect($attribute->flags)->toBe(['all']);
+});
+
 it('implements CommandInterface', function (): void {
     $reflection = new ReflectionClass(RetryCommand::class);
 

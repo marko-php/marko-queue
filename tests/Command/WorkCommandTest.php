@@ -21,7 +21,8 @@ function executeWorkCommand(
     array $args = ['marko', 'queue:work'],
 ): array {
     ['stream' => $stream, 'output' => $output] = Helpers::createOutputStream();
-    $input = new Input($args);
+    $flags = new ReflectionClass(WorkCommand::class)->getAttributes(Command::class)[0]->newInstance()->flags;
+    $input = new Input($args, $flags);
 
     $exitCode = $command->execute($input, $output);
     $result = Helpers::getOutputContent($stream);
@@ -126,6 +127,42 @@ it('supports queue option', function (): void {
     executeWorkCommand($command, ['marko', 'queue:work', '--queue=emails']);
 
     expect($capture->queue)->toBe('emails');
+});
+
+it('works the emails queue for queue:work --queue emails', function (): void {
+    $capture = (object) ['queue' => null, 'once' => null, 'sleep' => null];
+
+    $worker = new readonly class ($capture) implements WorkerInterface
+    {
+        public function __construct(
+            private object $capture,
+        ) {}
+
+        public function work(
+            ?string $queue = null,
+            bool $once = false,
+            int $sleep = 3,
+        ): void {
+            $this->capture->queue = $queue;
+            $this->capture->once = $once;
+            $this->capture->sleep = $sleep;
+        }
+
+        public function stop(): void {}
+    };
+
+    $command = new WorkCommand($worker);
+    executeWorkCommand($command, ['marko', 'queue:work', '--once', '--queue', 'emails', '--sleep', '5']);
+
+    expect($capture->queue)->toBe('emails')
+        ->and($capture->once)->toBeTrue()
+        ->and($capture->sleep)->toBe(5);
+});
+
+it('declares once as a flag on queue:work', function (): void {
+    $attribute = new ReflectionClass(WorkCommand::class)->getAttributes(Command::class)[0]->newInstance();
+
+    expect($attribute->flags)->toBe(['once']);
 });
 
 it('supports sleep option', function (): void {

@@ -11,7 +11,7 @@ use Marko\Core\Command\Output;
 use Marko\Queue\WorkerInterface;
 
 /** @noinspection PhpUnused */
-#[Command(name: 'queue:work', description: 'Process jobs from the queue')]
+#[Command(name: 'queue:work', description: 'Process jobs from the queue', flags: ['once'])]
 class WorkCommand implements CommandInterface
 {
     private const int DEFAULT_SLEEP = 3;
@@ -24,35 +24,14 @@ class WorkCommand implements CommandInterface
         Input $input,
         Output $output,
     ): int {
-        $args = $input->getArguments();
-        $once = in_array('--once', $args, true);
-        $queue = $this->getOptionValue($args, '--queue');
-        $sleep = (int) ($this->getOptionValue($args, '--sleep') ?? self::DEFAULT_SLEEP);
+        $once = $input->hasOption('once');
+        $queue = $input->getOption('queue');
+        $sleep = (int) ($input->getOption('sleep') ?? self::DEFAULT_SLEEP);
 
         $output->writeLine('Processing jobs from queue...');
 
         $this->worker->work(queue: $queue, once: $once, sleep: $sleep);
 
         return 0;
-    }
-
-    /**
-     * Get the value of an option (e.g., --queue=emails returns 'emails').
-     *
-     * @param array<string> $args
-     */
-    private function getOptionValue(
-        array $args,
-        string $option,
-    ): ?string {
-        $prefix = $option . '=';
-
-        foreach ($args as $arg) {
-            if (str_starts_with($arg, $prefix)) {
-                return substr($arg, strlen($prefix));
-            }
-        }
-
-        return null;
     }
 }
