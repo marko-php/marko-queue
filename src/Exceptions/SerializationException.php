@@ -47,7 +47,7 @@ class SerializationException extends QueueException
         return new self(
             message: 'Job payload HMAC signature does not match — possible tampering or data corruption.',
             context: 'Verifying HMAC-SHA256 signature of queue job envelope.',
-            suggestion: 'Do not modify queue payloads directly. Ensure all writers use the same app key.',
+            suggestion: 'Do not modify queue payloads directly. Ensure all writers use the same app key. Payloads queued by a release before HKDF signing subkeys no longer verify; drain the queue before upgrading.',
         );
     }
 
