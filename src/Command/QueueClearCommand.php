@@ -11,7 +11,7 @@ use Marko\Core\Command\Output;
 use Marko\Queue\QueueInterface;
 
 /** @noinspection PhpUnused */
-#[Command(name: 'queue:clear', description: 'Clear all jobs from queue')]
+#[Command(name: 'queue:clear', description: 'Clear all jobs from queue', destructive: true)]
 readonly class QueueClearCommand implements CommandInterface
 {
     public function __construct(
