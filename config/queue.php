@@ -7,6 +7,10 @@ return [
     'connection' => 'default',
     'queue' => 'default',
     'retry_after' => 90,
+
+    // Seconds one job may run under queue:work before it is failed and the worker exits; 0 disables it.
+    // Needs ext-pcntl, and must stay below retry_after. Override per worker with --timeout.
+    'timeout' => 60,
     'max_attempts' => 3,
 
     // Seconds to wait before retrying a failed job, used when the job sets no $backoff.

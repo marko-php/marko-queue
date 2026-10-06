@@ -48,6 +48,19 @@ describe('QueueConfig', function (): void {
         expect($queueConfig->retryAfter())->toBe(120);
     });
 
+    it('loads the timeout setting', function (): void {
+        $queueConfig = new QueueConfig(new FakeConfigRepository(['queue.timeout' => 45]));
+
+        expect($queueConfig->timeout())->toBe(45);
+    });
+
+    it('ships a default timeout below the default retry_after', function (): void {
+        $defaults = require dirname(__DIR__) . '/config/queue.php';
+
+        expect($defaults['timeout'])->toBe(60)
+            ->and($defaults['timeout'])->toBeLessThan($defaults['retry_after']);
+    });
+
     it('loads max_attempts setting', function (): void {
         $config = new FakeConfigRepository([
             'queue.max_attempts' => 5,

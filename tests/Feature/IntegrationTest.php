@@ -17,6 +17,7 @@ use Marko\Queue\QueueConfig;
 use Marko\Queue\QueueInterface;
 use Marko\Queue\Sync\NullFailedJobRepository;
 use Marko\Queue\Sync\SyncQueue;
+use Marko\Queue\Tests\Fixtures\FakeProcessControl;
 use Marko\Queue\Worker;
 use Marko\Queue\WorkerInterface;
 use Marko\Testing\Fake\FakeClock;
@@ -574,7 +575,8 @@ describe('Integration Tests', function (): void {
         // Set up components
         $queue = createInMemoryQueue();
         $failedRepository = createIntegrationFailedJobRepository();
-        $config = createIntegrationQueueConfig();
+        $config = createIntegrationQueueConfig(['queue.timeout' => 60]);
+        $processControl = new FakeProcessControl();
         $worker = new Worker(
             $queue,
             $failedRepository,
@@ -582,6 +584,7 @@ describe('Integration Tests', function (): void {
             createIntegrationJobEnvelope(),
             createIntegrationNullContainer(),
             new FakeClock(),
+            processControl: $processControl,
         );
 
         // Push a job to the queue
@@ -590,7 +593,7 @@ describe('Integration Tests', function (): void {
         expect($queue->size())->toBe(1);
 
         // Create WorkCommand with our worker
-        $workCommand = new WorkCommand($worker, $config);
+        $workCommand = new WorkCommand($worker, $config, $processControl);
 
         // Create output stream
         $stream = fopen('php://memory', 'r+');

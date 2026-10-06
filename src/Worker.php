@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Marko\Queue;
 
 use Marko\Core\Container\ContainerInterface;
+use Marko\Queue\Exceptions\JobTimedOutException;
 use Marko\Queue\Exceptions\QueueException;
 use Marko\Queue\Exceptions\SerializationException;
 use Psr\Clock\ClockInterface;
@@ -12,7 +13,12 @@ use Throwable;
 
 class Worker implements WorkerInterface
 {
+    /** Exit status of a worker process that ended because a job exceeded its timeout. */
+    public const int EXIT_TIMED_OUT = 1;
+
     private bool $running = false;
+
+    private bool $timedOut = false;
 
     public function __construct(
         private readonly QueueInterface $queue,
@@ -22,6 +28,7 @@ class Worker implements WorkerInterface
         private readonly ContainerInterface $container,
         private readonly ClockInterface $clock,
         private readonly BackoffValidator $backoffValidator = new BackoffValidator(),
+        private readonly ProcessControlInterface $processControl = new PcntlProcessControl(),
     ) {}
 
     /**
@@ -32,51 +39,159 @@ class Worker implements WorkerInterface
         ?array $queues = null,
         bool $once = false,
         int $sleep = 3,
+        WorkerOptions $options = new WorkerOptions(),
     ): void {
         $queueNames = $this->resolveQueueNames($queues);
         $this->running = true;
+        $jobsProcessed = 0;
 
-        while ($this->running) {
-            try {
-                [$job, $queue] = $this->popNextJob($queueNames);
-            } catch (Throwable $e) {
-                // A pop failure (an unreachable broker, a driver error) must not kill a long-running
-                // worker: report it, wait, and poll again. A single --once run reports it loudly instead.
-                if ($once) {
-                    throw $e;
+        // SIGTERM/SIGINT only stop the loop, so the current job finishes before the worker exits
+        $this->processControl->listenForTermination($this->stop(...));
+
+        try {
+            while ($this->running) {
+                try {
+                    [$job, $queue] = $this->popNextJob($queueNames);
+                } catch (Throwable $e) {
+                    // A pop failure (an unreachable broker, a driver error) must not kill a long-running
+                    // worker: report it, wait, and poll again. A single --once run reports it loudly instead.
+                    if ($once) {
+                        throw $e;
+                    }
+
+                    $this->reportPopFailure($e);
+                    $this->pause($sleep);
+
+                    continue;
                 }
 
-                $this->reportPopFailure($e);
-                $this->pause($sleep);
+                if ($job === null) {
+                    if ($once) {
+                        return;
+                    }
+                    $this->pause($sleep);
 
-                continue;
-            }
+                    continue;
+                }
 
-            if ($job === null) {
-                if ($once) {
+                $this->process($job, $queue ?? $this->config->queue(), $options->timeout);
+                $jobsProcessed++;
+
+                if ($once || $this->timedOut || $this->limitReached($options, $jobsProcessed)) {
                     return;
                 }
-                $this->pause($sleep);
-
-                continue;
             }
-
-            try {
-                $this->runJob($job);
-                $this->queue->delete($job->id);
-            } catch (Throwable $e) {
-                $this->handleFailedJob($job, $e, $queue ?? $this->config->queue());
-            }
-
-            if ($once) {
-                return;
-            }
+        } finally {
+            $this->processControl->stopListening();
         }
     }
 
     public function stop(): void
     {
         $this->running = false;
+    }
+
+    /**
+     * Run one attempt of the job, then delete it, or release or fail it if it threw.
+     *
+     * With a timeout, a timer fails the job once it runs too long and ends the worker process:
+     * a job stuck in a blocking call cannot be stopped safely from inside the process.
+     *
+     * @throws QueueException|SerializationException
+     */
+    private function process(
+        JobInterface $job,
+        string $queue,
+        int $timeout,
+    ): void {
+        $this->timedOut = false;
+        $error = null;
+
+        if ($timeout > 0) {
+            $this->processControl->startTimer(
+                $timeout,
+                fn () => $this->handleTimeout($job, $queue, $timeout),
+            );
+        }
+
+        try {
+            $this->runJob($job);
+        } catch (Throwable $e) {
+            $error = $e;
+        } finally {
+            if ($timeout > 0) {
+                $this->processControl->cancelTimer();
+            }
+        }
+
+        // The timeout handler has already released or failed the job
+        if ($this->timedOut) {
+            return;
+        }
+
+        if ($error === null) {
+            $this->queue->delete($job->id);
+
+            return;
+        }
+
+        $this->handleFailedJob($job, $error, $queue);
+    }
+
+    /**
+     * Fail the running job with a JobTimedOutException, then end the worker process.
+     *
+     * The job is released for another attempt, or recorded in failed_jobs on its last attempt,
+     * like a job that threw. The process then exits with EXIT_TIMED_OUT so its supervisor
+     * starts a fresh worker.
+     */
+    private function handleTimeout(
+        JobInterface $job,
+        string $queue,
+        int $timeout,
+    ): void {
+        $this->timedOut = true;
+        $this->running = false;
+
+        if ($job instanceof ContainerAwareJobInterface) {
+            $job->releaseContainer();
+        }
+
+        $exception = JobTimedOutException::exceeded($job::class, $timeout);
+
+        try {
+            $this->handleFailedJob($job, $exception, $queue);
+        } catch (Throwable $e) {
+            error_log(sprintf(
+                '[marko/queue] Could not release or fail timed-out job %s: %s: %s',
+                $job->id,
+                $e::class,
+                $e->getMessage(),
+            ));
+        }
+
+        error_log(sprintf(
+            '[marko/queue] %s The worker is exiting with status %d so its supervisor can restart it.',
+            $exception->getMessage(),
+            self::EXIT_TIMED_OUT,
+        ));
+
+        $this->processControl->terminate(self::EXIT_TIMED_OUT);
+    }
+
+    /**
+     * Whether the worker has reached its max-jobs or memory limit and should exit.
+     */
+    private function limitReached(
+        WorkerOptions $options,
+        int $jobsProcessed,
+    ): bool {
+        if ($options->maxJobs > 0 && $jobsProcessed >= $options->maxJobs) {
+            return true;
+        }
+
+        return $options->memory > 0
+            && $this->processControl->memoryUsage() >= $options->memory * 1024 * 1024;
     }
 
     /**
@@ -263,7 +378,7 @@ class Worker implements WorkerInterface
         string $queue,
         string $note = '',
     ): void {
-        $exception = $e->getMessage() . "\n" . $e->getTraceAsString() . $note;
+        $exception = $e->getMessage() . "\n" . $this->traceWithoutArguments($e) . $note;
 
         try {
             $serialized = $job->serialize();
@@ -284,5 +399,35 @@ class Worker implements WorkerInterface
             failedAt: $this->clock->now(),
         ));
         $this->queue->delete($job->id);
+    }
+
+    /**
+     * The exception's stack trace in getTraceAsString() format, without call arguments.
+     *
+     * getTraceAsString() includes arguments unless zend.exception_ignore_args is on, and they
+     * can hold passwords or tokens that must not be stored in failed_jobs.
+     */
+    private function traceWithoutArguments(
+        Throwable $e,
+    ): string {
+        $lines = [];
+
+        foreach ($e->getTrace() as $index => $frame) {
+            $location = isset($frame['file'])
+                ? $frame['file'] . '(' . ($frame['line'] ?? 0) . ')'
+                : '[internal function]';
+            $lines[] = sprintf(
+                '#%d %s: %s%s%s()',
+                $index,
+                $location,
+                $frame['class'] ?? '',
+                $frame['type'] ?? '',
+                $frame['function'],
+            );
+        }
+
+        $lines[] = '#' . count($lines) . ' {main}';
+
+        return implode("\n", $lines);
     }
 }

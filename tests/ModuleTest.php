@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 use Marko\Core\Event\AsyncObserverDispatcherInterface;
 use Marko\Queue\JobEnvelope;
+use Marko\Queue\PcntlProcessControl;
+use Marko\Queue\ProcessControlInterface;
 use Marko\Queue\QueueAsyncObserverDispatcher;
 use Marko\Queue\Worker;
 use Marko\Queue\WorkerInterface;
@@ -27,5 +29,11 @@ describe('queue module.php', function (): void {
 
         expect($module['bindings'][AsyncObserverDispatcherInterface::class])
             ->toBe(QueueAsyncObserverDispatcher::class);
+    });
+
+    it('binds ProcessControlInterface to PcntlProcessControl', function (): void {
+        $module = require dirname(__DIR__) . '/module.php';
+
+        expect($module['bindings'][ProcessControlInterface::class])->toBe(PcntlProcessControl::class);
     });
 });

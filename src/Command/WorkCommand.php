@@ -9,8 +9,10 @@ use Marko\Core\Command\CommandInterface;
 use Marko\Core\Command\Input;
 use Marko\Core\Command\Output;
 use Marko\Queue\Exceptions\QueueException;
+use Marko\Queue\ProcessControlInterface;
 use Marko\Queue\QueueConfig;
 use Marko\Queue\WorkerInterface;
+use Marko\Queue\WorkerOptions;
 
 /** @noinspection PhpUnused */
 #[Command(name: 'queue:work', description: 'Process jobs from the queue', flags: ['once'])]
@@ -21,6 +23,7 @@ class WorkCommand implements CommandInterface
     public function __construct(
         private readonly WorkerInterface $worker,
         private readonly QueueConfig $config,
+        private readonly ProcessControlInterface $processControl,
     ) {}
 
     public function execute(
@@ -38,9 +41,10 @@ class WorkCommand implements CommandInterface
             return 1;
         }
 
-        // A bad queue.backoff would otherwise surface only when the first job fails, maybe days later
         try {
+            // A bad queue.backoff would otherwise surface only when the first job fails, maybe days later
             $this->config->backoff();
+            $options = $this->resolveOptions($input);
         } catch (QueueException $e) {
             $output->writeLine('Error: ' . $e->getMessage());
             $output->writeLine($e->getContext());
@@ -49,11 +53,57 @@ class WorkCommand implements CommandInterface
             return 1;
         }
 
+        if (!$this->processControl->isSupported()) {
+            $output->writeLine(
+                'Warning: ext-pcntl is not loaded, so job timeouts are not enforced and SIGTERM/SIGINT'
+                . ' stop the worker immediately instead of after the current job.',
+            );
+        }
+
         $output->writeLine('Processing jobs from queue...');
 
-        $this->worker->work(queues: $queues, once: $once, sleep: $sleep);
+        $this->worker->work(queues: $queues, once: $once, sleep: $sleep, options: $options);
 
         return 0;
+    }
+
+    /**
+     * Build the worker limits from --timeout (default queue.timeout), --memory and --max-jobs.
+     *
+     * @throws QueueException When a value is not a non-negative integer, or the timeout is not below retry_after
+     */
+    private function resolveOptions(
+        Input $input,
+    ): WorkerOptions {
+        $timeout = $input->getOption('timeout');
+        $options = new WorkerOptions(
+            timeout: $timeout === null ? $this->config->timeout() : $this->parseLimit('timeout', $timeout),
+            memory: $this->parseLimit('memory', $input->getOption('memory') ?? '0'),
+            maxJobs: $this->parseLimit('max-jobs', $input->getOption('max-jobs') ?? '0'),
+        );
+
+        // A job still running when its reservation expires would be handed to a second worker
+        $retryAfter = $this->config->retryAfter();
+
+        if ($options->timeout > 0 && $options->timeout >= $retryAfter) {
+            throw QueueException::timeoutNotBelowRetryAfter($options->timeout, $retryAfter);
+        }
+
+        return $options;
+    }
+
+    /**
+     * @throws QueueException When the value is not a non-negative integer
+     */
+    private function parseLimit(
+        string $option,
+        string $value,
+    ): int {
+        if (!ctype_digit($value)) {
+            throw QueueException::invalidWorkerOption($option, $value);
+        }
+
+        return (int) $value;
     }
 
     /**

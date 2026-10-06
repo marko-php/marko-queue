@@ -9,6 +9,9 @@
         "marko/core": "self.version",
         "marko/encryption": "self.version"
     },
+    "suggest": {
+        "ext-pcntl": "Required for queue:work job timeouts and graceful SIGTERM/SIGINT shutdown"
+    },
     "require-dev": {
         "marko/testing": "self.version",
         "pestphp/pest": "^4.0"

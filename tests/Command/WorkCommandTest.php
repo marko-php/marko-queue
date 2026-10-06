@@ -6,9 +6,12 @@ use Marko\Core\Attributes\Command;
 use Marko\Core\Command\CommandInterface;
 use Marko\Core\Command\Input;
 use Marko\Queue\Command\WorkCommand;
+use Marko\Queue\ProcessControlInterface;
 use Marko\Queue\QueueConfig;
 use Marko\Queue\Tests\Command\Helpers;
+use Marko\Queue\Tests\Fixtures\FakeProcessControl;
 use Marko\Queue\WorkerInterface;
+use Marko\Queue\WorkerOptions;
 use Marko\Testing\Fake\FakeConfigRepository;
 
 /**
@@ -25,18 +28,30 @@ class CapturingWorker implements WorkerInterface
 
     public ?int $sleep = null;
 
+    public ?WorkerOptions $options = null;
+
     public function work(
         ?array $queues = null,
         bool $once = false,
         int $sleep = 3,
+        WorkerOptions $options = new WorkerOptions(),
     ): void {
         $this->called = true;
         $this->queues = $queues;
         $this->once = $once;
         $this->sleep = $sleep;
+        $this->options = $options;
     }
 
     public function stop(): void {}
+}
+
+function createWorkCommand(
+    WorkerInterface $worker,
+    QueueConfig $config,
+    ProcessControlInterface $processControl = new FakeProcessControl(),
+): WorkCommand {
+    return new WorkCommand($worker, $config, $processControl);
 }
 
 /**
@@ -68,7 +83,10 @@ function executeWorkCommand(
 function createWorkCommandConfig(
     array $values = [],
 ): QueueConfig {
-    return new QueueConfig(new FakeConfigRepository($values));
+    return new QueueConfig(new FakeConfigRepository(array_merge([
+        'queue.retry_after' => 90,
+        'queue.timeout' => 60,
+    ], $values)));
 }
 
 it('registers as queue:work command via #[Command] attribute', function (): void {
@@ -101,6 +119,7 @@ it('processes jobs continuously', function (): void {
             ?array $queues = null,
             bool $once = false,
             int $sleep = 3,
+            WorkerOptions $options = new WorkerOptions(),
         ): void {
             // Simulate processing multiple jobs
             while ($this->processed < $this->max) {
@@ -111,7 +130,7 @@ it('processes jobs continuously', function (): void {
         public function stop(): void {}
     };
 
-    $command = new WorkCommand($worker, createWorkCommandConfig());
+    $command = createWorkCommand($worker, createWorkCommandConfig());
     ['exitCode' => $exitCode] = executeWorkCommand($command);
 
     expect($jobsProcessed)->toBe(3)
@@ -121,7 +140,7 @@ it('processes jobs continuously', function (): void {
 it('supports once flag', function (): void {
     $worker = new CapturingWorker();
 
-    executeWorkCommand(new WorkCommand($worker, createWorkCommandConfig()), ['marko', 'queue:work', '--once']);
+    executeWorkCommand(createWorkCommand($worker, createWorkCommandConfig()), ['marko', 'queue:work', '--once']);
 
     expect($worker->once)->toBeTrue();
 });
@@ -129,7 +148,10 @@ it('supports once flag', function (): void {
 it('passes a single queue as a one-item list', function (): void {
     $worker = new CapturingWorker();
 
-    executeWorkCommand(new WorkCommand($worker, createWorkCommandConfig()), ['marko', 'queue:work', '--queue=emails']);
+    executeWorkCommand(
+        createWorkCommand($worker, createWorkCommandConfig()),
+        ['marko', 'queue:work', '--queue=emails'],
+    );
 
     expect($worker->queues)->toBe(['emails']);
 });
@@ -138,7 +160,7 @@ it('works the emails queue for queue:work --queue emails', function (): void {
     $worker = new CapturingWorker();
 
     executeWorkCommand(
-        new WorkCommand($worker, createWorkCommandConfig()),
+        createWorkCommand($worker, createWorkCommandConfig()),
         ['marko', 'queue:work', '--once', '--queue', 'emails', '--sleep', '5'],
     );
 
@@ -151,7 +173,7 @@ it('parses --queue=a,b --sleep=1 into a queue list and sleep', function (): void
     $worker = new CapturingWorker();
 
     executeWorkCommand(
-        new WorkCommand($worker, createWorkCommandConfig()),
+        createWorkCommand($worker, createWorkCommandConfig()),
         ['marko', 'queue:work', '--queue=a,b', '--sleep=1'],
     );
 
@@ -163,7 +185,7 @@ it('keeps the priority order of --queue=high,default,low', function (): void {
     $worker = new CapturingWorker();
 
     executeWorkCommand(
-        new WorkCommand($worker, createWorkCommandConfig()),
+        createWorkCommand($worker, createWorkCommandConfig()),
         ['marko', 'queue:work', '--queue=high,default,low'],
     );
 
@@ -174,7 +196,7 @@ it('trims whitespace around queue names', function (): void {
     $worker = new CapturingWorker();
 
     executeWorkCommand(
-        new WorkCommand($worker, createWorkCommandConfig()),
+        createWorkCommand($worker, createWorkCommandConfig()),
         ['marko', 'queue:work', '--queue', ' high , low '],
     );
 
@@ -185,7 +207,7 @@ it('drops empty segments such as --queue=high,,low', function (): void {
     $worker = new CapturingWorker();
 
     executeWorkCommand(
-        new WorkCommand($worker, createWorkCommandConfig()),
+        createWorkCommand($worker, createWorkCommandConfig()),
         ['marko', 'queue:work', '--queue=high,,low,'],
     );
 
@@ -195,7 +217,7 @@ it('drops empty segments such as --queue=high,,low', function (): void {
 it('passes null when no queue option is given', function (): void {
     $worker = new CapturingWorker();
 
-    executeWorkCommand(new WorkCommand($worker, createWorkCommandConfig()));
+    executeWorkCommand(createWorkCommand($worker, createWorkCommandConfig()));
 
     expect($worker->called)->toBeTrue()
         ->and($worker->queues)->toBeNull();
@@ -205,7 +227,7 @@ it('fails loudly when --queue contains no queue names', function (): void {
     $worker = new CapturingWorker();
 
     ['output' => $output, 'exitCode' => $exitCode] = executeWorkCommand(
-        new WorkCommand($worker, createWorkCommandConfig()),
+        createWorkCommand($worker, createWorkCommandConfig()),
         ['marko', 'queue:work', '--queue=,'],
     );
 
@@ -223,20 +245,20 @@ it('declares once as a flag on queue:work', function (): void {
 it('supports sleep option', function (): void {
     $worker = new CapturingWorker();
 
-    executeWorkCommand(new WorkCommand($worker, createWorkCommandConfig()), ['marko', 'queue:work', '--sleep=5']);
+    executeWorkCommand(createWorkCommand($worker, createWorkCommandConfig()), ['marko', 'queue:work', '--sleep=5']);
 
     expect($worker->sleep)->toBe(5);
 });
 
 it('displays processing status', function (): void {
-    ['output' => $output] = executeWorkCommand(new WorkCommand(new CapturingWorker(), createWorkCommandConfig()));
+    ['output' => $output] = executeWorkCommand(createWorkCommand(new CapturingWorker(), createWorkCommandConfig()));
 
     expect($output)->toContain('Processing jobs from queue');
 });
 
 it('refuses to start with an invalid queue.backoff config', function (): void {
     ['output' => $output, 'exitCode' => $exitCode] = executeWorkCommand(
-        new WorkCommand(new CapturingWorker(), createWorkCommandConfig(['queue.backoff' => [10, -5]])),
+        createWorkCommand(new CapturingWorker(), createWorkCommandConfig(['queue.backoff' => [10, -5]])),
     );
 
     expect($exitCode)->toBe(1)
@@ -249,7 +271,7 @@ it('refuses to start with an invalid queue.backoff config', function (): void {
 it('does not start the worker when queue.backoff is invalid', function (): void {
     $worker = new CapturingWorker();
 
-    executeWorkCommand(new WorkCommand($worker, createWorkCommandConfig(['queue.backoff' => -1])));
+    executeWorkCommand(createWorkCommand($worker, createWorkCommandConfig(['queue.backoff' => -1])));
 
     expect($worker->called)->toBeFalse();
 });
@@ -258,9 +280,96 @@ it('starts the worker when queue.backoff is valid', function (): void {
     $worker = new CapturingWorker();
 
     ['exitCode' => $exitCode] = executeWorkCommand(
-        new WorkCommand($worker, createWorkCommandConfig(['queue.backoff' => [5, 30]])),
+        createWorkCommand($worker, createWorkCommandConfig(['queue.backoff' => [5, 30]])),
     );
 
     expect($exitCode)->toBe(0)
         ->and($worker->called)->toBeTrue();
+});
+
+describe('queue:work limits', function (): void {
+    it('uses queue.timeout as the default job timeout, with memory and max-jobs off', function (): void {
+        $worker = new CapturingWorker();
+
+        executeWorkCommand(createWorkCommand($worker, createWorkCommandConfig(['queue.timeout' => 45])));
+
+        expect($worker->options?->timeout)->toBe(45)
+            ->and($worker->options?->memory)->toBe(0)
+            ->and($worker->options?->maxJobs)->toBe(0);
+    });
+
+    it('passes --timeout, --memory and --max-jobs to the worker', function (): void {
+        $worker = new CapturingWorker();
+
+        executeWorkCommand(
+            createWorkCommand($worker, createWorkCommandConfig()),
+            ['marko', 'queue:work', '--timeout=30', '--memory=256', '--max-jobs', '500'],
+        );
+
+        expect($worker->options?->timeout)->toBe(30)
+            ->and($worker->options?->memory)->toBe(256)
+            ->and($worker->options?->maxJobs)->toBe(500);
+    });
+
+    it('accepts --timeout=0 to turn the timeout off', function (): void {
+        $worker = new CapturingWorker();
+
+        executeWorkCommand(
+            createWorkCommand($worker, createWorkCommandConfig()),
+            ['marko', 'queue:work', '--timeout=0'],
+        );
+
+        expect($worker->options?->timeout)->toBe(0);
+    });
+
+    it('refuses a limit that is not a non-negative whole number', function (string $arg, string $message): void {
+        $worker = new CapturingWorker();
+
+        ['output' => $output, 'exitCode' => $exitCode] = executeWorkCommand(
+            createWorkCommand($worker, createWorkCommandConfig()),
+            ['marko', 'queue:work', $arg],
+        );
+
+        expect($exitCode)->toBe(1)
+            ->and($output)->toContain($message)
+            ->and($worker->called)->toBeFalse();
+    })->with([
+        'text timeout' => ['--timeout=soon', "--timeout must be a whole number of zero or more; got 'soon'."],
+        'negative memory' => ['--memory=-5', "--memory must be a whole number of zero or more; got '-5'."],
+        'fractional max-jobs' => ['--max-jobs=1.5', "--max-jobs must be a whole number of zero or more; got '1.5'."],
+    ]);
+
+    it('refuses a timeout that is not below queue.retry_after, so a job cannot run twice', function (): void {
+        $worker = new CapturingWorker();
+
+        ['output' => $output, 'exitCode' => $exitCode] = executeWorkCommand(
+            createWorkCommand($worker, createWorkCommandConfig(['queue.retry_after' => 90])),
+            ['marko', 'queue:work', '--timeout=90'],
+        );
+
+        expect($exitCode)->toBe(1)
+            ->and($output)->toContain('The queue worker timeout (90s) must be shorter than queue.retry_after (90s).')
+            ->and($output)->toContain('so it would run twice at once')
+            ->and($worker->called)->toBeFalse();
+    });
+
+    it('warns that timeouts and graceful shutdown need ext-pcntl when it is missing', function (): void {
+        $worker = new CapturingWorker();
+
+        ['output' => $output, 'exitCode' => $exitCode] = executeWorkCommand(
+            createWorkCommand($worker, createWorkCommandConfig(), new FakeProcessControl(supported: false)),
+        );
+
+        expect($exitCode)->toBe(0)
+            ->and($output)->toContain('Warning: ext-pcntl is not loaded, so job timeouts are not enforced')
+            ->and($worker->called)->toBeTrue();
+    });
+
+    it('does not warn when ext-pcntl is available', function (): void {
+        ['output' => $output] = executeWorkCommand(
+            createWorkCommand(new CapturingWorker(), createWorkCommandConfig(), new FakeProcessControl()),
+        );
+
+        expect($output)->not->toContain('Warning');
+    });
 });

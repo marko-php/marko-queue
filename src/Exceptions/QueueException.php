@@ -38,6 +38,30 @@ class QueueException extends MarkoException
         );
     }
 
+    public static function invalidWorkerOption(
+        string $option,
+        string $value,
+    ): self {
+        return new self(
+            message: "Invalid --$option value for the queue worker.",
+            context: "--$option must be a whole number of zero or more; got '$value'.",
+            suggestion: "Pass a non-negative integer, e.g. --$option=60, or 0 to turn the limit off.",
+        );
+    }
+
+    public static function timeoutNotBelowRetryAfter(
+        int $timeout,
+        int $retryAfter,
+    ): self {
+        return new self(
+            message: "The queue worker timeout ({$timeout}s) must be shorter than queue.retry_after ({$retryAfter}s).",
+            context: 'A job still running when retry_after expires is reclaimed and handed to another worker,'
+                . ' so it would run twice at once.',
+            suggestion: 'Lower queue.timeout / --timeout, or raise queue.retry_after above it'
+                . ' (leave a few seconds of margin).',
+        );
+    }
+
     public static function invalidBackoff(
         string $source,
         string $reason,

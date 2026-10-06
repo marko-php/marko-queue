@@ -34,6 +34,14 @@ readonly class QueueConfig
         return $this->config->getInt('queue.retry_after');
     }
 
+    /**
+     * Default seconds one job may run under queue:work before it is failed; 0 disables the timeout.
+     */
+    public function timeout(): int
+    {
+        return $this->config->getInt('queue.timeout');
+    }
+
     public function maxAttempts(): int
     {
         return $this->config->getInt('queue.max_attempts');
