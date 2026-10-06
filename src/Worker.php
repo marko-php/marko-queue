@@ -4,10 +4,10 @@ declare(strict_types=1);
 
 namespace Marko\Queue;
 
-use DateTimeImmutable;
 use Marko\Core\Container\ContainerInterface;
 use Marko\Queue\Exceptions\QueueException;
 use Marko\Queue\Exceptions\SerializationException;
+use Psr\Clock\ClockInterface;
 use Throwable;
 
 class Worker implements WorkerInterface
@@ -20,6 +20,7 @@ class Worker implements WorkerInterface
         private readonly QueueConfig $config,
         private readonly JobEnvelope $jobEnvelope,
         private readonly ContainerInterface $container,
+        private readonly ClockInterface $clock,
         private readonly BackoffValidator $backoffValidator = new BackoffValidator(),
     ) {}
 
@@ -254,7 +255,7 @@ class Worker implements WorkerInterface
             queue: $queue,
             payload: $this->jobEnvelope->wrap($serialized),
             exception: $exception,
-            failedAt: new DateTimeImmutable(),
+            failedAt: $this->clock->now(),
         ));
         $this->queue->delete($job->id);
     }

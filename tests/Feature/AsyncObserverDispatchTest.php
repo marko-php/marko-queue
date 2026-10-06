@@ -17,6 +17,7 @@ use Marko\Queue\QueueAsyncObserverDispatcher;
 use Marko\Queue\QueueConfig;
 use Marko\Queue\QueueInterface;
 use Marko\Queue\Worker;
+use Marko\Testing\Fake\FakeClock;
 use Marko\Testing\Fake\FakeConfigRepository;
 use Marko\Testing\Fake\FakeQueue;
 
@@ -139,7 +140,7 @@ describe('async observer dispatch through marko/queue', function (): void {
             'queue.max_attempts' => 3,
         ]));
 
-        new Worker($inbox, $failedJobRepository, $config, $jobEnvelope, $container)->work(once: true);
+        new Worker($inbox, $failedJobRepository, $config, $jobEnvelope, $container, new FakeClock())->work(once: true);
 
         expect(SendShippingEmail::$handled)->toHaveCount(1)
             ->and(SendShippingEmail::$handled[0])->toEqual($event)

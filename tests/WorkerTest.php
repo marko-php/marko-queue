@@ -16,6 +16,7 @@ use Marko\Queue\QueueConfig;
 use Marko\Queue\QueueInterface;
 use Marko\Queue\Worker;
 use Marko\Queue\WorkerInterface;
+use Marko\Testing\Fake\FakeClock;
 use Marko\Testing\Fake\FakeConfigRepository;
 
 function createWorkerTestEnvelope(
@@ -332,6 +333,7 @@ describe('Worker', function (): void {
             $config,
             createWorkerTestEnvelope(),
             createNullWorkerContainer(),
+            new FakeClock(),
         );
 
         expect($worker)->toBeInstanceOf(WorkerInterface::class);
@@ -431,6 +433,7 @@ describe('Worker', function (): void {
             $config,
             createWorkerTestEnvelope(),
             createNullWorkerContainer(),
+            new FakeClock(),
         );
 
         $worker->work(once: true);
@@ -524,6 +527,7 @@ describe('Worker', function (): void {
             $config,
             createWorkerTestEnvelope(),
             createNullWorkerContainer(),
+            new FakeClock(),
         );
 
         $worker->work(once: true);
@@ -558,6 +562,7 @@ describe('Worker', function (): void {
             $config,
             createWorkerTestEnvelope(),
             createNullWorkerContainer(),
+            new FakeClock(),
         );
         StopTestHelper::$worker = $worker;
 
@@ -648,6 +653,7 @@ describe('Worker', function (): void {
             $config,
             createWorkerTestEnvelope(),
             createNullWorkerContainer(),
+            new FakeClock(),
         );
 
         // With once=true, worker should process exactly one job and return
@@ -724,6 +730,7 @@ describe('Worker', function (): void {
             $config,
             createWorkerTestEnvelope(),
             createNullWorkerContainer(),
+            new FakeClock(),
         );
 
         // With once=true and no jobs, worker should return immediately
@@ -824,6 +831,7 @@ describe('Worker', function (): void {
             $config,
             createWorkerTestEnvelope(),
             createNullWorkerContainer(),
+            new FakeClock(),
         );
 
         // Process jobs (once each)
@@ -928,7 +936,7 @@ describe('Worker', function (): void {
             $failedRepository = createTestFailedJobRepository();
             $config = createTestQueueConfig();
 
-            $worker = new Worker($queue, $failedRepository, $config, $envelope, $container);
+            $worker = new Worker($queue, $failedRepository, $config, $envelope, $container, new FakeClock());
             $worker->work(once: true);
 
             expect($capture->called)->toBeTrue()
@@ -1024,6 +1032,7 @@ function runFailingJobOnce(
     JobInterface $job,
     int $priorAttempts,
     int $configMaxAttempts,
+    FakeClock $clock = new FakeClock(),
 ): array {
     $job->setId('job-1');
 
@@ -1040,6 +1049,7 @@ function runFailingJobOnce(
         createTestQueueConfig(['queue.max_attempts' => $configMaxAttempts]),
         createWorkerTestEnvelope(),
         createNullWorkerContainer(),
+        $clock,
     );
     $worker->work(once: true);
 
@@ -1071,6 +1081,14 @@ describe('Worker max attempts', function (): void {
 
         expect($result['queue']->releasedWithDelays)->toBe([])
             ->and($result['failed']->count())->toBe(1);
+    });
+
+    it('records the failed job with the time from the injected clock', function (): void {
+        $clock = new FakeClock('2026-03-01 09:15:00 UTC');
+
+        $result = runFailingJobOnce(new FailingTestJob(), priorAttempts: 1, configMaxAttempts: 10, clock: $clock);
+
+        expect($result['failed']->find('job-1')?->failedAt)->toEqual(new DateTimeImmutable('2026-03-01 09:15:00 UTC'));
     });
 });
 
@@ -1111,6 +1129,7 @@ function createBackoffWorker(
         createTestQueueConfig($configValues),
         createWorkerTestEnvelope(),
         createNullWorkerContainer(),
+        new FakeClock(),
     );
 }
 
@@ -1296,6 +1315,7 @@ class PauseRecordingWorker extends Worker
             $config,
             createWorkerTestEnvelope(),
             createNullWorkerContainer(),
+            new FakeClock(),
         );
     }
 
@@ -1632,6 +1652,7 @@ function runJobsOnLastAttempt(
         createTestQueueConfig(),
         createWorkerTestEnvelope(),
         createNullWorkerContainer(),
+        new FakeClock(),
     );
     $stopJob->worker = $worker;
 
@@ -1748,6 +1769,7 @@ function runJobsOnFirstAttempt(
         createTestQueueConfig($configValues),
         createWorkerTestEnvelope(),
         createNullWorkerContainer(),
+        new FakeClock(),
     );
     $stopJob->worker = $worker;
 

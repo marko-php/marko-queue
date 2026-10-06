@@ -20,6 +20,7 @@ use Marko\Queue\QueueInterface;
 use Marko\Queue\Tests\Command\Helpers;
 use Marko\Queue\Tests\Command\StubFailedJobRepository;
 use Marko\Queue\Worker;
+use Marko\Testing\Fake\FakeClock;
 use Marko\Testing\Fake\FakeConfigRepository;
 
 /**
@@ -574,6 +575,7 @@ function createRetryWorker(
         ])),
         createRetryCommandEnvelope(),
         $container,
+        new FakeClock(),
     );
 }
 
