@@ -8,6 +8,12 @@ use Marko\Queue\JobEnvelope;
 use Marko\Queue\Tests\Fixtures\PrivatePropertyJob;
 use Marko\Testing\Fake\FakeConfigRepository;
 
+function jobEnvelopeSubkey(
+    string $key = 'test-key-for-hmac-verification',
+): string {
+    return hash_hkdf('sha256', $key, 32, 'marko-queue-envelope');
+}
+
 function createJobEnvelope(
     string $key = 'test-key-for-hmac-verification',
 ): JobEnvelope {
@@ -35,7 +41,7 @@ describe('JobEnvelope', function (): void {
         $wrapped = $envelope->wrap($serialized);
 
         expect(substr($wrapped, 65))->toBe($body)
-            ->and(substr($wrapped, 0, 64))->toBe(hash_hmac('sha256', $body, 'test-key-for-hmac-verification'));
+            ->and(substr($wrapped, 0, 64))->toBe(hash_hmac('sha256', $body, jobEnvelopeSubkey()));
     });
 
     it('produces envelopes without NUL bytes for objects with private and protected properties', function (): void {
@@ -53,12 +59,29 @@ describe('JobEnvelope', function (): void {
         expect($envelope->verifyAndUnwrap($envelope->wrap($serialized)))->toBe($serialized);
     });
 
-    it('still verifies and unwraps legacy raw envelopes', function (): void {
+    it('signs with an HKDF subkey rather than the raw app encryption key', function (): void {
+        $envelope = createJobEnvelope();
+        $body = 'b64:' . base64_encode('O:8:"TestJob":0:{}');
+        $signedWithRawKey = hash_hmac('sha256', $body, 'test-key-for-hmac-verification') . '.' . $body;
+
+        expect(jobEnvelopeSubkey())->not->toBe('test-key-for-hmac-verification')
+            ->and(fn () => $envelope->verifyAndUnwrap($signedWithRawKey))
+            ->toThrow(SerializationException::class, 'HMAC signature does not match');
+    });
+
+    it('derives a subkey that differs from the cache signer subkey for the same app key', function (): void {
+        expect(jobEnvelopeSubkey())
+            ->not->toBe(hash_hkdf('sha256', 'test-key-for-hmac-verification', 32, 'marko-cache-signer'))
+            ->and(JobEnvelope::KEY_PURPOSE)->toBe('marko-queue-envelope');
+    });
+
+    it('rejects a correctly signed body that lacks the b64 marker', function (): void {
         $envelope = createJobEnvelope();
         $serialized = serialize(new PrivatePropertyJob('secret', 'shared'));
-        $legacy = hash_hmac('sha256', $serialized, 'test-key-for-hmac-verification') . '.' . $serialized;
+        $raw = hash_hmac('sha256', $serialized, jobEnvelopeSubkey()) . '.' . $serialized;
 
-        expect($envelope->verifyAndUnwrap($legacy))->toBe($serialized);
+        expect(fn () => $envelope->verifyAndUnwrap($raw))
+            ->toThrow(SerializationException::class, 'Invalid job data');
     });
 
     it('rejects a new-format envelope whose base64 was tampered with', function (): void {
@@ -75,7 +98,7 @@ describe('JobEnvelope', function (): void {
         function (): void {
             $envelope = createJobEnvelope();
             $body = 'b64:not*valid*base64!';
-            $forged = hash_hmac('sha256', $body, 'test-key-for-hmac-verification') . '.' . $body;
+            $forged = hash_hmac('sha256', $body, jobEnvelopeSubkey()) . '.' . $body;
 
             expect(fn () => $envelope->verifyAndUnwrap($forged))
                 ->toThrow(SerializationException::class, 'Invalid job data');
