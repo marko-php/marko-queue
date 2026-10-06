@@ -37,7 +37,20 @@ class Worker implements WorkerInterface
         $this->running = true;
 
         while ($this->running) {
-            [$job, $queue] = $this->popNextJob($queueNames);
+            try {
+                [$job, $queue] = $this->popNextJob($queueNames);
+            } catch (Throwable $e) {
+                // A pop failure (an unreachable broker, a driver error) must not kill a long-running
+                // worker: report it, wait, and poll again. A single --once run reports it loudly instead.
+                if ($once) {
+                    throw $e;
+                }
+
+                $this->reportPopFailure($e);
+                $this->pause($sleep);
+
+                continue;
+            }
 
             if ($job === null) {
                 if ($once) {
@@ -156,6 +169,19 @@ class Worker implements WorkerInterface
         }
 
         return [null, null];
+    }
+
+    /**
+     * Log a failed pop to PHP's error log (STDERR for a CLI worker) so it is visible without stopping the worker.
+     */
+    private function reportPopFailure(
+        Throwable $e,
+    ): void {
+        error_log(sprintf(
+            '[marko/queue] Worker could not pop a job, retrying after the sleep interval: %s: %s',
+            $e::class,
+            $e->getMessage(),
+        ));
     }
 
     /**

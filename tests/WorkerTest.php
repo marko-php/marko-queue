@@ -1884,3 +1884,104 @@ describe('Worker invalid backoff', function (): void {
             ->toThrow(QueueException::class, 'Driver could not release the job.');
     });
 });
+
+/**
+ * Throws from pop() for the first $failures calls, then pops jobs like MultiQueueRecordingQueue.
+ */
+class FailingPopQueue extends MultiQueueRecordingQueue
+{
+    private int $pops = 0;
+
+    /**
+     * @param array<string, list<JobInterface>> $jobs
+     */
+    public function __construct(
+        array $jobs,
+        RecordingLog $log,
+        private readonly int $failures = 1,
+    ) {
+        parent::__construct($jobs, $log);
+    }
+
+    public function pop(
+        ?string $queue = null,
+    ): ?JobInterface {
+        if ($this->pops++ < $this->failures) {
+            throw new RuntimeException('Broker connection lost');
+        }
+
+        return parent::pop($queue);
+    }
+}
+
+/**
+ * Point PHP's error log at a temp file for the callback and return what was logged.
+ */
+function captureWorkerErrorLog(
+    callable $callback,
+): string {
+    $file = tempnam(sys_get_temp_dir(), 'marko-worker-log');
+    $previous = ini_set('error_log', $file);
+
+    try {
+        $callback();
+    } finally {
+        ini_set('error_log', (string) $previous);
+    }
+
+    $logged = (string) file_get_contents($file);
+    unlink($file);
+
+    return $logged;
+}
+
+describe('Worker pop failures', function (): void {
+    it('keeps running when pop() throws, then processes the next job', function (): void {
+        $log = new RecordingLog();
+        $queue = new FailingPopQueue(['default' => [namedJob('after-failure', $log)]], $log);
+        $worker = new PauseRecordingWorker(
+            $queue,
+            createTestFailedJobRepository(),
+            createTestQueueConfig(),
+            $log,
+            stopAfterPauses: 2,
+        );
+
+        captureWorkerErrorLog(fn () => $worker->work(sleep: 7));
+
+        expect($log->entries)->toBe([
+            'sleep:7',
+            'pop:null',
+            'handle:after-failure',
+            'pop:null',
+            'sleep:7',
+        ]);
+    });
+
+    it('logs the pop failure with the exception class and message', function (): void {
+        $log = new RecordingLog();
+        $worker = new PauseRecordingWorker(
+            new FailingPopQueue([], $log),
+            createTestFailedJobRepository(),
+            createTestQueueConfig(),
+            $log,
+        );
+
+        $logged = captureWorkerErrorLog(fn () => $worker->work());
+
+        expect($logged)->toContain('Worker could not pop a job')
+            ->and($logged)->toContain('RuntimeException: Broker connection lost');
+    });
+
+    it('rethrows a pop failure in --once mode instead of reporting success', function (): void {
+        $log = new RecordingLog();
+        $worker = new PauseRecordingWorker(
+            new FailingPopQueue([], $log),
+            createTestFailedJobRepository(),
+            createTestQueueConfig(),
+            $log,
+        );
+
+        expect(fn () => $worker->work(once: true))->toThrow(RuntimeException::class, 'Broker connection lost');
+    });
+});
