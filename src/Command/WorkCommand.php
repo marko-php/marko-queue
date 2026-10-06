@@ -8,6 +8,8 @@ use Marko\Core\Attributes\Command;
 use Marko\Core\Command\CommandInterface;
 use Marko\Core\Command\Input;
 use Marko\Core\Command\Output;
+use Marko\Queue\Exceptions\QueueException;
+use Marko\Queue\QueueConfig;
 use Marko\Queue\WorkerInterface;
 
 /** @noinspection PhpUnused */
@@ -18,6 +20,7 @@ class WorkCommand implements CommandInterface
 
     public function __construct(
         private readonly WorkerInterface $worker,
+        private readonly QueueConfig $config,
     ) {}
 
     public function execute(
@@ -31,6 +34,17 @@ class WorkCommand implements CommandInterface
 
         if ($queues === []) {
             $output->writeLine('Error: --queue needs at least one queue name, e.g. --queue=high,default.');
+
+            return 1;
+        }
+
+        // A bad queue.backoff would otherwise surface only when the first job fails, maybe days later
+        try {
+            $this->config->backoff();
+        } catch (QueueException $e) {
+            $output->writeLine('Error: ' . $e->getMessage());
+            $output->writeLine($e->getContext());
+            $output->writeLine($e->getSuggestion());
 
             return 1;
         }

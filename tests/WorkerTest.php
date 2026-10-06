@@ -1717,3 +1717,148 @@ describe('Worker failed job serialization', function (): void {
             ->and($result['failed']->count())->toBe(2);
     });
 });
+
+/**
+ * Run the worker over the jobs until the trailing stop job runs.
+ *
+ * Every job is on its first attempt, so a failing job has attempts left (queue.max_attempts is 3).
+ *
+ * @param list<JobInterface> $jobs
+ * @param array<string, mixed> $configValues
+ * @return array{queue: SequenceRecordingQueue, failed: FailedJobRepositoryInterface}
+ */
+function runJobsOnFirstAttempt(
+    array $jobs,
+    array $configValues = [],
+    ?SequenceRecordingQueue $queue = null,
+): array {
+    foreach ($jobs as $index => $job) {
+        $job->setId("job-$index");
+    }
+
+    $stopJob = new StopWorkerJob();
+    $stopJob->setId('stop-worker');
+
+    $queue ??= new SequenceRecordingQueue([...$jobs, $stopJob]);
+    $failedRepository = createTestFailedJobRepository();
+
+    $worker = new Worker(
+        $queue,
+        $failedRepository,
+        createTestQueueConfig($configValues),
+        createWorkerTestEnvelope(),
+        createNullWorkerContainer(),
+    );
+    $stopJob->worker = $worker;
+
+    $worker->work();
+
+    return ['queue' => $queue, 'failed' => $failedRepository];
+}
+
+/**
+ * Job with an invalid backoff whose payload can never be serialized: it holds a closure.
+ */
+class ClosureHoldingInvalidBackoffJob extends Job
+{
+    public function __construct(
+        public readonly Closure $callback,
+    ) {
+        $this->backoff = -1;
+    }
+
+    public function handle(): void
+    {
+        throw new RuntimeException('Closure job with bad backoff failed');
+    }
+}
+
+/**
+ * Queue whose release() fails, as a broken driver would.
+ */
+class FailingReleaseQueue extends SequenceRecordingQueue
+{
+    public function release(
+        string $jobId,
+        int $delay = 0,
+    ): bool {
+        throw new QueueException('Driver could not release the job.');
+    }
+}
+
+describe('Worker invalid backoff', function (): void {
+    it(
+        'stores a job with an invalid backoff in failed jobs with the job error and the backoff error',
+        function (): void {
+            $result = runJobsOnFirstAttempt([new BackoffFailingJob(-5)]);
+
+            $failedJob = $result['failed']->find('job-0');
+
+            expect($failedJob)->not->toBeNull()
+                ->and($failedJob->exception)->toContain('Always fails')
+                ->and($failedJob->exception)->toContain(
+                    'Invalid queue backoff in job ' . BackoffFailingJob::class . '.',
+                )
+                ->and($failedJob->exception)->toContain('delay must not be negative; got -5');
+        },
+    );
+
+    it('deletes a job with an invalid backoff from the queue instead of releasing it', function (): void {
+        $result = runJobsOnFirstAttempt([new BackoffFailingJob([])]);
+
+        expect($result['queue']->released)->toBe([])
+            ->and($result['queue']->deleted)->toContain('job-0');
+    });
+
+    it('processes the next job after failing a job with an invalid backoff', function (): void {
+        $result = runJobsOnFirstAttempt([new BackoffFailingJob(['a' => 10]), new BackoffFailingJob(5)]);
+
+        expect($result['failed']->count())->toBe(1)
+            ->and($result['queue']->released)->toBe(['job-1'])
+            ->and($result['queue']->deleted)->toBe(['job-0', 'stop-worker']);
+    });
+
+    it('stores a retryable copy of the job that had an invalid backoff', function (): void {
+        $result = runJobsOnFirstAttempt([new BackoffFailingJob(-5)]);
+
+        $stored = unserialize(
+            createWorkerTestEnvelope()->verifyAndUnwrap($result['failed']->find('job-0')->payload),
+        );
+
+        expect($stored)->toBeInstanceOf(BackoffFailingJob::class)
+            ->and($stored->backoff)->toBe(-5);
+    });
+
+    it('fails the job when the queue.backoff config is invalid instead of stopping the worker', function (): void {
+        $result = runJobsOnFirstAttempt([new BackoffFailingJob()], ['queue.backoff' => [10, 'soon']]);
+
+        $failedJob = $result['failed']->find('job-0');
+
+        expect($failedJob)->not->toBeNull()
+            ->and($failedJob->exception)->toContain('Always fails')
+            ->and($failedJob->exception)->toContain('Invalid queue backoff in config queue.backoff.')
+            ->and($result['queue']->deleted)->toBe(['job-0', 'stop-worker']);
+    });
+
+    it(
+        'records the job error, the backoff error and the serialization note when an invalid-backoff job cannot be serialized',
+        function (): void {
+            $result = runJobsOnFirstAttempt([new ClosureHoldingInvalidBackoffJob(fn (): null => null)]);
+
+            $failedJob = $result['failed']->find('job-0');
+
+            expect($failedJob->exception)->toContain('Closure job with bad backoff failed')
+                ->and($failedJob->exception)->toContain('Invalid queue backoff in job')
+                ->and($failedJob->exception)->toContain('Job payload could not be serialized');
+        },
+    );
+
+    it("still propagates a QueueException thrown by the driver's release()", function (): void {
+        $job = new BackoffFailingJob(5);
+        $job->setId('job-0');
+        $queue = new FailingReleaseQueue([$job]);
+
+        expect(fn () => runJobsOnFirstAttempt([], queue: $queue))
+            ->toThrow(QueueException::class, 'Driver could not release the job.');
+    });
+});

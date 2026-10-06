@@ -11,6 +11,7 @@ readonly class QueueConfig
 {
     public function __construct(
         private ConfigRepositoryInterface $config,
+        private BackoffValidator $backoffValidator = new BackoffValidator(),
     ) {}
 
     public function driver(): string
@@ -43,7 +44,8 @@ readonly class QueueConfig
      * or null for the built-in exponential curve (2^attempts * 10 seconds).
      *
      * An app config that sets `backoff` to null removes the key during config merging,
-     * so an absent key also means null.
+     * so an absent key also means null. Any other value must be a non-negative int or a
+     * non-empty list of non-negative ints.
      *
      * @return int|list<int>|null
      * @throws QueueException
@@ -56,14 +58,10 @@ readonly class QueueConfig
 
         $backoff = $this->config->get('queue.backoff');
 
-        if ($backoff !== null && !is_int($backoff) && !is_array($backoff)) {
-            throw QueueException::invalidBackoff(
-                source: 'config queue.backoff',
-                reason: 'expected an int, a list of ints, or null; got ' . get_debug_type($backoff),
-            );
+        if ($backoff === null) {
+            return null;
         }
 
-        /** @var int|list<int>|null $backoff */
-        return $backoff;
+        return $this->backoffValidator->validate($backoff, 'config queue.backoff');
     }
 }

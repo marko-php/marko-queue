@@ -587,7 +587,7 @@ describe('Integration Tests', function (): void {
         expect($queue->size())->toBe(1);
 
         // Create WorkCommand with our worker
-        $workCommand = new WorkCommand($worker);
+        $workCommand = new WorkCommand($worker, $config);
 
         // Create output stream
         $stream = fopen('php://memory', 'r+');

@@ -20,6 +20,7 @@ class Worker implements WorkerInterface
         private readonly QueueConfig $config,
         private readonly JobEnvelope $jobEnvelope,
         private readonly ContainerInterface $container,
+        private readonly BackoffValidator $backoffValidator = new BackoffValidator(),
     ) {}
 
     /**
@@ -162,63 +163,32 @@ class Worker implements WorkerInterface
      * Uses the job's $backoff, then the `queue.backoff` config, then the exponential
      * curve 2^attempts * 10. A list backoff is indexed by attempt and its last value repeats.
      *
-     * @throws QueueException
+     * @throws QueueException When the job's $backoff or the queue.backoff config is invalid
      */
     public function backoffFor(
         JobInterface $job,
     ): int {
-        if ($job->backoff !== null) {
-            return $this->resolveBackoff($job->backoff, $job->attempts, 'job ' . $job::class);
+        $backoff = $job->backoff !== null
+            ? $this->backoffValidator->validate($job->backoff, 'job ' . $job::class)
+            : $this->config->backoff();
+
+        if ($backoff === null) {
+            return (int) pow(2, $job->attempts) * 10;
         }
 
-        $configBackoff = $this->config->backoff();
-
-        if ($configBackoff !== null) {
-            return $this->resolveBackoff($configBackoff, $job->attempts, 'config queue.backoff');
-        }
-
-        return (int) pow(2, $job->attempts) * 10;
-    }
-
-    /**
-     * @param int|array<mixed> $backoff
-     * @throws QueueException
-     */
-    private function resolveBackoff(
-        array|int $backoff,
-        int $attempts,
-        string $source,
-    ): int {
         if (is_int($backoff)) {
-            if ($backoff < 0) {
-                throw QueueException::invalidBackoff($source, "delay must not be negative; got $backoff");
-            }
-
             return $backoff;
         }
 
-        if ($backoff === [] || !array_is_list($backoff)) {
-            throw QueueException::invalidBackoff($source, 'a backoff array must be a non-empty list of ints');
-        }
-
-        foreach ($backoff as $delay) {
-            if (!is_int($delay) || $delay < 0) {
-                throw QueueException::invalidBackoff(
-                    $source,
-                    'every backoff list entry must be a non-negative int; got ' . var_export($delay, true),
-                );
-            }
-        }
-
-        return $backoff[min(max($attempts, 1), count($backoff)) - 1];
+        return $backoff[min(max($job->attempts, 1), count($backoff)) - 1];
     }
 
     /**
      * Release a failed job for another attempt, or record it in failed_jobs on its last attempt.
      *
-     * A job whose payload cannot be serialized (for example one holding a closure) is still
-     * recorded, with a placeholder payload of its class and the serialization error, and
-     * deleted from the queue, so the worker keeps running. queue:retry refuses that row.
+     * A job whose backoff is invalid cannot be released, so it is recorded in failed_jobs with
+     * both its own error and the backoff error, and the worker keeps running: one bad job class
+     * must not stop every worker. Fix the backoff, then queue:retry the job.
      *
      * @throws QueueException|SerializationException
      */
@@ -229,30 +199,63 @@ class Worker implements WorkerInterface
     ): void {
         $maxAttempts = $job->maxAttempts ?? $this->config->maxAttempts();
 
-        if ($job->attempts < $maxAttempts) {
-            $this->queue->release($job->id, $this->backoffFor($job));
-        } else {
-            $exception = $e->getMessage() . "\n" . $e->getTraceAsString();
+        if ($job->attempts >= $maxAttempts) {
+            $this->storeFailedJob($job, $e, $queue);
 
-            try {
-                $serialized = $job->serialize();
-            } catch (Throwable $serializationError) {
-                $serialized = serialize([
-                    'class' => $job::class,
-                    'serialization_error' => $serializationError->getMessage(),
-                ]);
-                $exception .= "\n\nJob payload could not be serialized, so this failed job cannot be retried. "
-                    . 'Job class ' . $job::class . ': ' . $serializationError->getMessage();
-            }
-
-            $this->failedJobRepository->store(new FailedJob(
-                id: $job->id,
-                queue: $queue,
-                payload: $this->jobEnvelope->wrap($serialized),
-                exception: $exception,
-                failedAt: new DateTimeImmutable(),
-            ));
-            $this->queue->delete($job->id);
+            return;
         }
+
+        try {
+            $delay = $this->backoffFor($job);
+        } catch (QueueException $backoffError) {
+            $this->storeFailedJob(
+                $job,
+                $e,
+                $queue,
+                "\n\nJob could not be retried: " . $backoffError->getMessage() . ' ' . $backoffError->getContext(),
+            );
+
+            return;
+        }
+
+        $this->queue->release($job->id, $delay);
+    }
+
+    /**
+     * Store the job in failed_jobs and delete it from the queue.
+     *
+     * A job whose payload cannot be serialized (for example one holding a closure) is still
+     * recorded, with a placeholder payload of its class and the serialization error, and
+     * deleted from the queue, so the worker keeps running. queue:retry refuses that row.
+     *
+     * @throws SerializationException
+     */
+    private function storeFailedJob(
+        JobInterface $job,
+        Throwable $e,
+        string $queue,
+        string $note = '',
+    ): void {
+        $exception = $e->getMessage() . "\n" . $e->getTraceAsString() . $note;
+
+        try {
+            $serialized = $job->serialize();
+        } catch (Throwable $serializationError) {
+            $serialized = serialize([
+                'class' => $job::class,
+                'serialization_error' => $serializationError->getMessage(),
+            ]);
+            $exception .= "\n\nJob payload could not be serialized, so this failed job cannot be retried. "
+                . 'Job class ' . $job::class . ': ' . $serializationError->getMessage();
+        }
+
+        $this->failedJobRepository->store(new FailedJob(
+            id: $job->id,
+            queue: $queue,
+            payload: $this->jobEnvelope->wrap($serialized),
+            exception: $exception,
+            failedAt: new DateTimeImmutable(),
+        ));
+        $this->queue->delete($job->id);
     }
 }

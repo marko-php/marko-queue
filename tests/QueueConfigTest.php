@@ -125,6 +125,20 @@ describe('QueueConfig', function (): void {
         expect(fn () => $config->backoff())->toThrow(QueueException::class, 'Invalid queue backoff');
     });
 
+    it('throws QueueException for a queue.backoff list with a non-int entry', function (): void {
+        $config = new QueueConfig(new FakeConfigRepository(['queue.backoff' => [10, 'soon']]));
+
+        expect(fn () => $config->backoff())
+            ->toThrow(QueueException::class, 'Invalid queue backoff in config queue.backoff');
+    });
+
+    it('throws QueueException for a negative queue.backoff', function (): void {
+        $config = new QueueConfig(new FakeConfigRepository(['queue.backoff' => -10]));
+
+        expect(fn () => $config->backoff())
+            ->toThrow(QueueException::class, 'Invalid queue backoff in config queue.backoff');
+    });
+
     it('ships a null backoff in config/queue.php', function (): void {
         $config = require dirname(__DIR__) . '/config/queue.php';
 
