@@ -10,18 +10,23 @@ use Marko\Queue\Exceptions\SerializationException;
 /**
  * HMAC-signed, transport-safe wrapper around serialized queue payloads.
  *
- * Current format: {64-char-hex-hmac}.b64:{base64(serialized)}
+ * Format: {64-char-hex-hmac}.b64:{base64(serialized)}
  *
  * PHP's serialize() emits NUL bytes for private and protected properties, which
  * PostgreSQL TEXT columns reject. Base64 keeps the envelope 7-bit clean for every
  * storage backend. The HMAC covers the whole segment after the separator, so the
  * "b64:" marker is authenticated too.
  *
- * Legacy format: {64-char-hex-hmac}.{serialized}. Envelopes written before the
- * base64 format still verify, so rows already queued keep working after upgrade.
+ * The HMAC key is a subkey derived from the app encryption key with HKDF, so the
+ * key that encrypts data is never also used to sign queue payloads.
  */
 readonly class JobEnvelope
 {
+    /**
+     * HKDF info string that scopes the derived subkey to queue envelopes.
+     */
+    public const string KEY_PURPOSE = 'marko-queue-envelope';
+
     private const string BASE64_MARKER = 'b64:';
 
     public function __construct(
@@ -43,7 +48,7 @@ readonly class JobEnvelope
     }
 
     /**
-     * Verify an HMAC-signed envelope (current or legacy format) and return the inner serialized bytes.
+     * Verify an HMAC-signed envelope and return the inner serialized bytes.
      *
      * @throws SerializationException when the envelope does not verify, is malformed, or the key is empty
      */
@@ -65,7 +70,7 @@ readonly class JobEnvelope
         }
 
         if (!str_starts_with($body, self::BASE64_MARKER)) {
-            return $body;
+            throw SerializationException::invalidJobData('the envelope body is missing the b64: marker');
         }
 
         $decoded = base64_decode(substr($body, strlen(self::BASE64_MARKER)), true);
@@ -78,6 +83,8 @@ readonly class JobEnvelope
     }
 
     /**
+     * Derive the queue-envelope HMAC subkey from the app encryption key.
+     *
      * @throws SerializationException when the signing key is empty
      */
     private function signingKey(): string
@@ -88,6 +95,6 @@ readonly class JobEnvelope
             throw SerializationException::emptySigningKey();
         }
 
-        return $key;
+        return hash_hkdf('sha256', $key, 32, self::KEY_PURPOSE);
     }
 }
