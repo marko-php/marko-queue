@@ -5,13 +5,21 @@ declare(strict_types=1);
 use Marko\Core\Attributes\Command;
 use Marko\Core\Command\CommandInterface;
 use Marko\Core\Command\Input;
+use Marko\Core\Container\Container;
+use Marko\Core\Container\ContainerInterface;
 use Marko\Encryption\Config\EncryptionConfig;
 use Marko\Queue\Command\RetryCommand;
+use Marko\Queue\ContainerAwareJobInterface;
 use Marko\Queue\Exceptions\SerializationException;
 use Marko\Queue\FailedJob;
 use Marko\Queue\Job;
 use Marko\Queue\JobEnvelope;
+use Marko\Queue\JobInterface;
+use Marko\Queue\QueueConfig;
+use Marko\Queue\QueueInterface;
 use Marko\Queue\Tests\Command\Helpers;
+use Marko\Queue\Tests\Command\StubFailedJobRepository;
+use Marko\Queue\Worker;
 use Marko\Testing\Fake\FakeConfigRepository;
 
 /**
@@ -339,4 +347,293 @@ it('rejects a tampered failed-job payload in the retry command', function (): vo
 
     expect(fn () => $command->execute($input, $output))
         ->toThrow(SerializationException::class);
+});
+
+/**
+ * A failed-job row whose payload is the worker's placeholder for a job that could not be serialized.
+ */
+function createUnserializableFailedJob(
+    string $id,
+): FailedJob {
+    return new FailedJob(
+        id: $id,
+        queue: 'default',
+        payload: createRetryCommandEnvelope()->wrap(serialize([
+            'class' => 'App\Jobs\ClosureJob',
+            'serialization_error' => "Serialization of 'Closure' is not allowed",
+        ])),
+        exception: 'Closure job failed',
+        failedAt: new DateTimeImmutable('2024-01-01 12:00:00'),
+    );
+}
+
+it('refuses to retry a failed job whose payload could not be serialized', function (): void {
+    $repository = Helpers::createStubFailedJobRepository([createUnserializableFailedJob('closure-job')]);
+    $queue = Helpers::createStubQueue();
+    $command = new RetryCommand($repository, $queue, createRetryCommandEnvelope());
+
+    ['output' => $output, 'stream' => $stream] = Helpers::createOutputStream();
+    $exitCode = $command->execute(new Input(['marko', 'queue:retry', 'closure-job']), $output);
+
+    expect($exitCode)->toBe(1)
+        ->and(Helpers::getOutputContent($stream))
+        ->toContain('Job closure-job cannot be retried')
+        ->toContain('App\Jobs\ClosureJob')
+        ->toContain("Serialization of 'Closure' is not allowed")
+        ->and($queue->pushedJobs)->toBe([])
+        ->and($repository->deletedIds)->toBe([]);
+});
+
+it('skips failed jobs whose payload could not be serialized when retrying all', function (): void {
+    $repository = Helpers::createStubFailedJobRepository([
+        createFailedJob('job-1'),
+        createUnserializableFailedJob('closure-job'),
+        createFailedJob('job-2'),
+    ]);
+    $queue = Helpers::createStubQueue();
+    $command = new RetryCommand($repository, $queue, createRetryCommandEnvelope());
+
+    ['output' => $output, 'stream' => $stream] = Helpers::createOutputStream();
+    $exitCode = $command->execute(new Input(['marko', 'queue:retry', '--all']), $output);
+
+    expect($exitCode)->toBe(1)
+        ->and(Helpers::getOutputContent($stream))
+        ->toContain('Job closure-job cannot be retried')
+        ->toContain('2 jobs pushed back to queue.')
+        ->toContain('1 job skipped.')
+        ->and($queue->pushedJobs)->toHaveCount(2)
+        ->and($repository->deletedIds)->toBe(['job-1', 'job-2']);
+});
+
+it('refuses to retry a failed job whose payload is not a job', function (): void {
+    $failedJob = new FailedJob(
+        id: 'not-a-job',
+        queue: 'default',
+        payload: createRetryCommandEnvelope()->wrap(serialize('just a string')),
+        exception: 'Test exception',
+        failedAt: new DateTimeImmutable('2024-01-01 12:00:00'),
+    );
+    $repository = Helpers::createStubFailedJobRepository([$failedJob]);
+    $queue = Helpers::createStubQueue();
+    $command = new RetryCommand($repository, $queue, createRetryCommandEnvelope());
+
+    ['output' => $output, 'stream' => $stream] = Helpers::createOutputStream();
+    $exitCode = $command->execute(new Input(['marko', 'queue:retry', 'not-a-job']), $output);
+
+    expect($exitCode)->toBe(1)
+        ->and(Helpers::getOutputContent($stream))->toContain('Job not-a-job cannot be retried')
+        ->and($queue->pushedJobs)->toBe([]);
+});
+
+/**
+ * Service a retried container-aware job resolves from whichever container the worker gives it.
+ */
+class RetryRecordingService
+{
+    public int $calls = 0;
+
+    public function run(): void
+    {
+        $this->calls++;
+    }
+}
+
+/**
+ * Container-aware job that resolves RetryRecordingService when it runs.
+ */
+class RetryContainerAwareJob extends Job implements ContainerAwareJobInterface
+{
+    public private(set) ?ContainerInterface $container = null;
+
+    public private(set) int $attemptsWhenHandled = 0;
+
+    public function setContainer(ContainerInterface $container): void
+    {
+        $this->container = $container;
+    }
+
+    public function setJobEnvelope(JobEnvelope $jobEnvelope): void {}
+
+    public function releaseContainer(): void
+    {
+        $this->container = null;
+    }
+
+    public function handle(): void
+    {
+        $this->attemptsWhenHandled = $this->attempts;
+        $this->container->get(RetryRecordingService::class)->run();
+    }
+}
+
+/**
+ * In-memory queue: push() stores a job and pop() hands it back.
+ */
+class RetryRoundTripQueue implements QueueInterface
+{
+    /** @var list<JobInterface> */
+    private array $jobs = [];
+
+    public function push(
+        JobInterface $job,
+        ?string $queue = null,
+    ): string {
+        $job->setId('round-trip-job');
+        $this->jobs[] = $job;
+
+        return 'round-trip-job';
+    }
+
+    public function later(
+        int $delay,
+        JobInterface $job,
+        ?string $queue = null,
+    ): string {
+        return $this->push($job, $queue);
+    }
+
+    public function pop(
+        ?string $queue = null,
+    ): ?JobInterface {
+        return array_shift($this->jobs);
+    }
+
+    public function size(
+        ?string $queue = null,
+    ): int {
+        return count($this->jobs);
+    }
+
+    public function clear(
+        ?string $queue = null,
+    ): int {
+        return 0;
+    }
+
+    public function delete(
+        string $jobId,
+    ): bool {
+        return true;
+    }
+
+    public function release(
+        string $jobId,
+        int $delay = 0,
+    ): bool {
+        return true;
+    }
+}
+
+/**
+ * A container that cannot be serialized (anonymous class) and resolves nothing.
+ */
+function createFailingRetryContainer(): ContainerInterface
+{
+    return new class () implements ContainerInterface
+    {
+        public function get(string $id): never
+        {
+            throw new RuntimeException("Service unavailable: $id");
+        }
+
+        public function has(string $id): bool
+        {
+            return false;
+        }
+
+        public function singleton(string $id): void {}
+
+        public function instance(
+            string $id,
+            object $instance,
+        ): void {}
+
+        public function call(Closure $callable): mixed
+        {
+            return null;
+        }
+
+        public function resolvedInstances(?string $interface = null): array
+        {
+            return [];
+        }
+    };
+}
+
+function createRetryWorker(
+    QueueInterface $queue,
+    StubFailedJobRepository $failedJobRepository,
+    ContainerInterface $container,
+): Worker {
+    return new Worker(
+        $queue,
+        $failedJobRepository,
+        new QueueConfig(new FakeConfigRepository([
+            'queue.queue' => 'default',
+            'queue.max_attempts' => 1,
+        ])),
+        createRetryCommandEnvelope(),
+        $container,
+    );
+}
+
+/**
+ * Fail a RetryContainerAwareJob for the last time under a container that resolves nothing.
+ *
+ * @return array{queue: RetryRoundTripQueue, failed: StubFailedJobRepository}
+ */
+function failContainerAwareJobForTheLastTime(): array
+{
+    $queue = new RetryRoundTripQueue();
+    $failedRepository = Helpers::createStubFailedJobRepository();
+    $queue->push(new RetryContainerAwareJob());
+
+    createRetryWorker($queue, $failedRepository, createFailingRetryContainer())->work(once: true);
+
+    return ['queue' => $queue, 'failed' => $failedRepository];
+}
+
+it('stores the failed container-aware job payload without the container', function (): void {
+    ['failed' => $failedRepository] = failContainerAwareJobForTheLastTime();
+
+    $stored = unserialize(createRetryCommandEnvelope()->verifyAndUnwrap($failedRepository->all()[0]->payload));
+
+    expect($stored)->toBeInstanceOf(RetryContainerAwareJob::class)
+        ->and($stored->container)->toBeNull();
+});
+
+it('retries a stored failed container-aware job and runs it with a fresh container', function (): void {
+    ['queue' => $queue, 'failed' => $failedRepository] = failContainerAwareJobForTheLastTime();
+
+    $service = new RetryRecordingService();
+    $freshContainer = new Container();
+    $freshContainer->instance(RetryRecordingService::class, $service);
+
+    ['output' => $output] = Helpers::createOutputStream();
+    $exitCode = new RetryCommand($failedRepository, $queue, createRetryCommandEnvelope())
+        ->execute(new Input(['marko', 'queue:retry', 'round-trip-job']), $output);
+
+    createRetryWorker($queue, $failedRepository, $freshContainer)->work(once: true);
+
+    expect($exitCode)->toBe(0)
+        ->and($service->calls)->toBe(1)
+        ->and($failedRepository->count())->toBe(0);
+});
+
+it('resets the retried container-aware job attempts before it runs again', function (): void {
+    ['queue' => $queue, 'failed' => $failedRepository] = failContainerAwareJobForTheLastTime();
+
+    ['output' => $output] = Helpers::createOutputStream();
+    new RetryCommand($failedRepository, $queue, createRetryCommandEnvelope())
+        ->execute(new Input(['marko', 'queue:retry', 'round-trip-job']), $output);
+
+    /** @var RetryContainerAwareJob $retried */
+    $retried = $queue->pop();
+    $queue->push($retried);
+
+    $freshContainer = new Container();
+    $freshContainer->instance(RetryRecordingService::class, new RetryRecordingService());
+    createRetryWorker($queue, $failedRepository, $freshContainer)->work(once: true);
+
+    expect($retried->attemptsWhenHandled)->toBe(1);
 });

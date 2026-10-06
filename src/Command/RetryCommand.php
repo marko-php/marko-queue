@@ -9,6 +9,7 @@ use Marko\Core\Command\CommandInterface;
 use Marko\Core\Command\Input;
 use Marko\Core\Command\Output;
 use Marko\Queue\Exceptions\SerializationException;
+use Marko\Queue\FailedJob;
 use Marko\Queue\FailedJobRepositoryInterface;
 use Marko\Queue\JobEnvelope;
 use Marko\Queue\JobInterface;
@@ -61,10 +62,18 @@ readonly class RetryCommand implements CommandInterface
         }
 
         $count = 0;
+        $skipped = 0;
 
         foreach ($failedJobs as $failedJob) {
-            /** @var JobInterface $job */
-            $job = unserialize($this->jobEnvelope->verifyAndUnwrap($failedJob->payload));
+            $job = $this->unserializeJob($failedJob);
+
+            if (!$job instanceof JobInterface) {
+                $output->writeLine($this->notRetryableMessage($failedJob->id, $job));
+                $skipped++;
+
+                continue;
+            }
+
             $job->resetAttempts();
             $this->queue->push($job, $failedJob->queue);
             $this->failedJobRepository->delete($failedJob->id);
@@ -72,6 +81,12 @@ readonly class RetryCommand implements CommandInterface
         }
 
         $output->writeLine("$count jobs pushed back to queue.");
+
+        if ($skipped > 0) {
+            $output->writeLine($skipped === 1 ? '1 job skipped.' : "$skipped jobs skipped.");
+
+            return 1;
+        }
 
         return 0;
     }
@@ -91,9 +106,14 @@ readonly class RetryCommand implements CommandInterface
             return 1;
         }
 
-        // Verify and unserialize the job from the payload
-        /** @var JobInterface $job */
-        $job = unserialize($this->jobEnvelope->verifyAndUnwrap($failedJob->payload));
+        $job = $this->unserializeJob($failedJob);
+
+        if (!$job instanceof JobInterface) {
+            $output->writeLine($this->notRetryableMessage($jobId, $job));
+
+            return 1;
+        }
+
         $job->resetAttempts();
 
         // Push it back to the queue
@@ -105,5 +125,32 @@ readonly class RetryCommand implements CommandInterface
         $output->writeLine("Job $jobId pushed back to queue.");
 
         return 0;
+    }
+
+    /**
+     * Verify the payload's signature and unserialize it. The result is not always a job: the
+     * worker stores a placeholder array for a job whose payload could not be serialized.
+     *
+     * @throws SerializationException
+     */
+    private function unserializeJob(
+        FailedJob $failedJob,
+    ): mixed {
+        return unserialize($this->jobEnvelope->verifyAndUnwrap($failedJob->payload));
+    }
+
+    private function notRetryableMessage(
+        string $jobId,
+        mixed $payload,
+    ): string {
+        if (is_array($payload) && is_string($payload['class'] ?? null)
+            && is_string($payload['serialization_error'] ?? null)) {
+            return "Job $jobId cannot be retried: its payload could not be serialized when it failed "
+                . "({$payload['class']}: {$payload['serialization_error']}). "
+                . 'Remove closures, resources and live services from the job, then dispatch it again.';
+        }
+
+        return "Job $jobId cannot be retried: its payload is not a queue job ("
+            . get_debug_type($payload) . ').';
     }
 }

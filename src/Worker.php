@@ -47,13 +47,7 @@ class Worker implements WorkerInterface
             }
 
             try {
-                if ($job instanceof ContainerAwareJobInterface) {
-                    $job->setContainer($this->container);
-                    $job->setJobEnvelope($this->jobEnvelope);
-                }
-
-                $job->incrementAttempts();
-                $job->handle();
+                $this->runJob($job);
                 $this->queue->delete($job->id);
             } catch (Throwable $e) {
                 $this->handleFailedJob($job, $e, $queue ?? $this->config->queue());
@@ -68,6 +62,35 @@ class Worker implements WorkerInterface
     public function stop(): void
     {
         $this->running = false;
+    }
+
+    /**
+     * Handle one attempt of the job.
+     *
+     * A container-aware job gets the container and envelope first, and releases them
+     * afterwards whether handle() returns or throws: a job that fails for the last time
+     * is serialized into failed_jobs, and the container cannot be serialized.
+     *
+     * @throws Throwable
+     */
+    private function runJob(
+        JobInterface $job,
+    ): void {
+        if (!$job instanceof ContainerAwareJobInterface) {
+            $job->incrementAttempts();
+            $job->handle();
+
+            return;
+        }
+
+        try {
+            $job->setContainer($this->container);
+            $job->setJobEnvelope($this->jobEnvelope);
+            $job->incrementAttempts();
+            $job->handle();
+        } finally {
+            $job->releaseContainer();
+        }
     }
 
     /**
@@ -191,7 +214,13 @@ class Worker implements WorkerInterface
     }
 
     /**
-     * @throws SerializationException
+     * Release a failed job for another attempt, or record it in failed_jobs on its last attempt.
+     *
+     * A job whose payload cannot be serialized (for example one holding a closure) is still
+     * recorded, with a placeholder payload of its class and the serialization error, and
+     * deleted from the queue, so the worker keeps running. queue:retry refuses that row.
+     *
+     * @throws QueueException|SerializationException
      */
     private function handleFailedJob(
         JobInterface $job,
@@ -203,11 +232,24 @@ class Worker implements WorkerInterface
         if ($job->attempts < $maxAttempts) {
             $this->queue->release($job->id, $this->backoffFor($job));
         } else {
+            $exception = $e->getMessage() . "\n" . $e->getTraceAsString();
+
+            try {
+                $serialized = $job->serialize();
+            } catch (Throwable $serializationError) {
+                $serialized = serialize([
+                    'class' => $job::class,
+                    'serialization_error' => $serializationError->getMessage(),
+                ]);
+                $exception .= "\n\nJob payload could not be serialized, so this failed job cannot be retried. "
+                    . 'Job class ' . $job::class . ': ' . $serializationError->getMessage();
+            }
+
             $this->failedJobRepository->store(new FailedJob(
                 id: $job->id,
                 queue: $queue,
-                payload: $this->jobEnvelope->wrap($job->serialize()),
-                exception: $e->getMessage() . "\n" . $e->getTraceAsString(),
+                payload: $this->jobEnvelope->wrap($serialized),
+                exception: $exception,
                 failedAt: new DateTimeImmutable(),
             ));
             $this->queue->delete($job->id);

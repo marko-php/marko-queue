@@ -36,35 +36,32 @@ class AsyncObserverJob extends Job implements ContainerAwareJobInterface
      * with the deserialized event. When a JobEnvelope has been set, the eventData
      * is treated as an HMAC-signed envelope and verified before unserializing.
      *
-     * The container and envelope are released afterwards, even on failure: the
-     * worker serializes a job that has used up its attempts into failed_jobs, and
-     * the container cannot be serialized.
+     * The worker and the sync driver call releaseContainer() afterwards, even on failure.
      *
      * @throws SerializationException|RuntimeException
      */
     public function handle(): void
     {
-        $container = $this->container;
-
-        if ($container === null) {
+        if ($this->container === null) {
             throw new RuntimeException(
                 'AsyncObserverJob::handle() was called without a container. '
                 . 'Call setContainer() before handle() to provide the DI container for observer resolution.',
             );
         }
 
-        try {
-            $rawEventData = $this->jobEnvelope !== null
-                ? $this->jobEnvelope->verifyAndUnwrap($this->eventData)
-                : $this->eventData;
+        $rawEventData = $this->jobEnvelope !== null
+            ? $this->jobEnvelope->verifyAndUnwrap($this->eventData)
+            : $this->eventData;
 
-            $event = unserialize($rawEventData);
+        $event = unserialize($rawEventData);
 
-            $observer = $container->get($this->observerClass);
-            $observer->handle($event);
-        } finally {
-            $this->container = null;
-            $this->jobEnvelope = null;
-        }
+        $observer = $this->container->get($this->observerClass);
+        $observer->handle($event);
+    }
+
+    public function releaseContainer(): void
+    {
+        $this->container = null;
+        $this->jobEnvelope = null;
     }
 }

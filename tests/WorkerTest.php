@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Marko\Core\Container\ContainerInterface;
 use Marko\Encryption\Config\EncryptionConfig;
 use Marko\Queue\AsyncObserverJob;
+use Marko\Queue\ContainerAwareJobInterface;
 use Marko\Queue\Exceptions\QueueException;
 use Marko\Queue\FailedJob;
 use Marko\Queue\FailedJobRepositoryInterface;
@@ -1459,4 +1460,260 @@ describe('Worker priority queues', function (): void {
         'not a string' => [['high', 5]],
         'not a list' => [['first' => 'high']],
     ]);
+});
+
+/**
+ * Pops the given jobs in order and records what the worker did with each one.
+ */
+class SequenceRecordingQueue implements QueueInterface
+{
+    /** @var list<string> */
+    public array $deleted = [];
+
+    /** @var list<string> */
+    public array $released = [];
+
+    /**
+     * @param list<JobInterface> $jobs
+     */
+    public function __construct(
+        private array $jobs,
+    ) {}
+
+    public function push(
+        JobInterface $job,
+        ?string $queue = null,
+    ): string {
+        return 'unused';
+    }
+
+    public function later(
+        int $delay,
+        JobInterface $job,
+        ?string $queue = null,
+    ): string {
+        return 'unused';
+    }
+
+    public function pop(
+        ?string $queue = null,
+    ): ?JobInterface {
+        return array_shift($this->jobs);
+    }
+
+    public function size(
+        ?string $queue = null,
+    ): int {
+        return count($this->jobs);
+    }
+
+    public function clear(
+        ?string $queue = null,
+    ): int {
+        return 0;
+    }
+
+    public function delete(
+        string $jobId,
+    ): bool {
+        $this->deleted[] = $jobId;
+
+        return true;
+    }
+
+    public function release(
+        string $jobId,
+        int $delay = 0,
+    ): bool {
+        $this->released[] = $jobId;
+
+        return true;
+    }
+}
+
+/**
+ * Container-aware job that keeps the injected container until releaseContainer() runs.
+ */
+class RecordingContainerAwareJob extends Job implements ContainerAwareJobInterface
+{
+    public private(set) ?ContainerInterface $container = null;
+
+    public private(set) ?JobEnvelope $jobEnvelope = null;
+
+    public private(set) int $releaseCount = 0;
+
+    public private(set) bool $hadContainerWhenHandled = false;
+
+    public function __construct(
+        public readonly bool $fails = false,
+    ) {}
+
+    public function setContainer(ContainerInterface $container): void
+    {
+        $this->container = $container;
+    }
+
+    public function setJobEnvelope(JobEnvelope $jobEnvelope): void
+    {
+        $this->jobEnvelope = $jobEnvelope;
+    }
+
+    public function releaseContainer(): void
+    {
+        $this->container = null;
+        $this->jobEnvelope = null;
+        $this->releaseCount++;
+    }
+
+    public function handle(): void
+    {
+        $this->hadContainerWhenHandled = $this->container !== null && $this->jobEnvelope !== null;
+
+        if ($this->fails) {
+            throw new RuntimeException('Container-aware job always fails');
+        }
+    }
+}
+
+/**
+ * Job whose payload can never be serialized: it holds a closure.
+ */
+class ClosureHoldingFailingJob extends Job
+{
+    public function __construct(
+        public readonly Closure $callback,
+    ) {}
+
+    public function handle(): void
+    {
+        throw new RuntimeException('Closure job failed');
+    }
+}
+
+/**
+ * Stops the worker when it runs, proving the worker survived every job before it.
+ */
+class StopWorkerJob extends Job
+{
+    public ?Worker $worker = null;
+
+    public function handle(): void
+    {
+        $this->worker?->stop();
+    }
+}
+
+/**
+ * Run the worker over the jobs until the trailing stop job runs.
+ *
+ * Every job is put on its last attempt first (queue.max_attempts is 3).
+ *
+ * @param list<JobInterface> $jobs
+ * @return array{queue: SequenceRecordingQueue, failed: FailedJobRepositoryInterface}
+ */
+function runJobsOnLastAttempt(
+    array $jobs,
+): array {
+    foreach ($jobs as $index => $job) {
+        $job->setId("job-$index");
+        $job->incrementAttempts();
+        $job->incrementAttempts();
+    }
+
+    $stopJob = new StopWorkerJob();
+    $stopJob->setId('stop-worker');
+
+    $queue = new SequenceRecordingQueue([...$jobs, $stopJob]);
+    $failedRepository = createTestFailedJobRepository();
+
+    $worker = new Worker(
+        $queue,
+        $failedRepository,
+        createTestQueueConfig(),
+        createWorkerTestEnvelope(),
+        createNullWorkerContainer(),
+    );
+    $stopJob->worker = $worker;
+
+    $worker->work();
+
+    return ['queue' => $queue, 'failed' => $failedRepository];
+}
+
+describe('Worker failed job serialization', function (): void {
+    it(
+        'stores a container-aware job that always fails in the failed-job repository once it reaches maxAttempts',
+        function (): void {
+            $result = runJobsOnLastAttempt([new RecordingContainerAwareJob(fails: true)]);
+
+            $failedJob = $result['failed']->find('job-0');
+            $stored = unserialize(createWorkerTestEnvelope()->verifyAndUnwrap($failedJob->payload));
+
+            expect($failedJob->exception)->toContain('Container-aware job always fails')
+                ->and($stored)->toBeInstanceOf(RecordingContainerAwareJob::class)
+                ->and($stored->container)->toBeNull();
+        },
+    );
+
+    it('keeps working after a container-aware job fails for the last time', function (): void {
+        $result = runJobsOnLastAttempt([new RecordingContainerAwareJob(fails: true)]);
+
+        expect($result['queue']->deleted)->toBe(['job-0', 'stop-worker'])
+            ->and($result['queue']->released)->toBe([]);
+    });
+
+    it('releases the container from a container-aware job after handle succeeds', function (): void {
+        $job = new RecordingContainerAwareJob();
+
+        runJobsOnLastAttempt([$job]);
+
+        expect($job->hadContainerWhenHandled)->toBeTrue()
+            ->and($job->releaseCount)->toBe(1)
+            ->and($job->container)->toBeNull();
+    });
+
+    it('releases the container from a container-aware job after handle throws', function (): void {
+        $job = new RecordingContainerAwareJob(fails: true);
+
+        runJobsOnLastAttempt([$job]);
+
+        expect($job->hadContainerWhenHandled)->toBeTrue()
+            ->and($job->releaseCount)->toBe(1)
+            ->and($job->container)->toBeNull();
+    });
+
+    it('records a job whose payload cannot be serialized as failed with the serialization error', function (): void {
+        $result = runJobsOnLastAttempt([new ClosureHoldingFailingJob(fn (): null => null)]);
+
+        $failedJob = $result['failed']->find('job-0');
+
+        expect($failedJob)->not->toBeNull()
+            ->and($failedJob->exception)->toContain('Closure job failed')
+            ->and($failedJob->exception)->toContain('Job payload could not be serialized')
+            ->and($failedJob->exception)->toContain(ClosureHoldingFailingJob::class)
+            ->and($failedJob->exception)->toContain("Serialization of 'Closure' is not allowed");
+    });
+
+    it('stores the job class in the payload of a job that cannot be serialized', function (): void {
+        $result = runJobsOnLastAttempt([new ClosureHoldingFailingJob(fn (): null => null)]);
+
+        $payload = unserialize(
+            createWorkerTestEnvelope()->verifyAndUnwrap($result['failed']->find('job-0')->payload),
+        );
+
+        expect($payload)->toBe([
+            'class' => ClosureHoldingFailingJob::class,
+            'serialization_error' => "Serialization of 'Closure' is not allowed",
+        ]);
+    });
+
+    it('deletes a job that cannot be serialized from the queue and keeps working', function (): void {
+        $result = runJobsOnLastAttempt([
+            new ClosureHoldingFailingJob(fn (): null => null),
+            new RecordingContainerAwareJob(fails: true),
+        ]);
+
+        expect($result['queue']->deleted)->toBe(['job-0', 'job-1', 'stop-worker'])
+            ->and($result['failed']->count())->toBe(2);
+    });
 });
